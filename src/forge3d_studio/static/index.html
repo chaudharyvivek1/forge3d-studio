@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>forge3d studio</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b0d10; --panel:#12151b; --line:#232936;
+          --fg:#e8ecf2; --dim:#8b95a5; --accent:#d4693a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.6 ui-sans-serif,
+         system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex;
+           justify-content:space-between; align-items:center; }
+  h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.01em; }
+  main { display:grid; grid-template-columns: 360px 1fr; min-height: calc(100vh - 62px); }
+  aside { border-right:1px solid var(--line); padding:20px; }
+  section { padding:20px; }
+  label { display:block; font-size:12px; color:var(--dim); margin:14px 0 6px; }
+  input, select, button { font:inherit; }
+  input, select { width:100%; padding:9px 11px; border-radius:8px; border:1px solid var(--line);
+                  background:#0e1116; color:var(--fg); }
+  button { margin-top:14px; width:100%; padding:10px; border-radius:8px; border:1px solid #3a2a22;
+           background:#2a1a12; color:#ffb08a; cursor:pointer; }
+  button:hover { background:#3a2317; }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; align-items:baseline; font-size:12px; color:var(--dim); }
+  .row b { color:var(--fg); font-weight:500; }
+  .bar { height:4px; background:#1b2029; border-radius:2px; overflow:hidden; margin-top:10px; }
+  .bar > i { display:block; height:100%; width:0; background:var(--accent); transition:width .3s; }
+  .item { border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:10px;
+          cursor:pointer; background:var(--panel); }
+  .item:hover { border-color:#3a4254; }
+  iframe { width:100%; height:calc(100vh - 130px); border:1px solid var(--line); border-radius:10px;
+           background:#05060a; }
+  .muted { color:var(--dim); font-size:12px; }
+  code { background:#12151b; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>forge3d studio</h1>
+  <div class="muted" id="who">not signed in</div>
+</header>
+<main>
+  <aside>
+    <div id="auth-box">
+      <label for="email">email</label>
+      <input id="email" type="email" placeholder="you@example.com" value="you@example.com" />
+      <button id="btn-login">send sign-in link</button>
+      <p class="muted">Dev mode returns the token here instead of emailing it.</p>
+    </div>
+
+    <div id="app-box" hidden>
+      <div class="row"><span>credits</span><b id="credits">—</b></div>
+      <label for="kind">generate</label>
+      <select id="kind">
+        <option value="shape">shape — from the equation library</option>
+        <option value="planet">planet — procedural, with baked PBR</option>
+        <option value="provider">provider — paid, needs an API key</option>
+      </select>
+      <label for="shape">shape name</label>
+      <input id="shape" value="torus_knot" />
+      <button id="btn-run">generate</button>
+      <div class="bar"><i id="bar"></i></div>
+      <div class="row" style="margin-top:8px"><span>status</span><b id="status">idle</b></div>
+      <p class="muted" id="note"></p>
+    </div>
+
+    <label>library</label>
+    <div id="assets" class="muted">nothing yet</div>
+  </aside>
+  <section>
+    <div id="empty" class="muted">
+      Generate something, then click it in the library to open its viewer.
+    </div>
+    <iframe id="viewer" hidden></iframe>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const api = (path, options = {}) =>
+  fetch(path, { credentials: "same-origin", headers: { "content-type": "application/json" },
+                ...options }).then(async (r) => {
+    const text = await r.text();
+    let body; try { body = JSON.parse(text); } catch { body = text; }
+    if (!r.ok) throw new Error(body.detail || body.error || r.statusText);
+    return body;
+  });
+
+$("btn-login").onclick = async () => {
+  try {
+    const res = await api("/auth/request", { method: "POST",
+      body: JSON.stringify({ email: $("email").value }) });
+    if (!res.dev_token) { $("note").textContent = res.note; return; }
+    await api("/auth/callback?token=" + encodeURIComponent(res.dev_token));
+    await boot();
+  } catch (e) { $("note").textContent = e.message; }
+};
+
+async function boot() {
+  try {
+    const me = await api("/me");
+    $("who").textContent = me.email;
+    $("credits").textContent = me.credits;
+    $("auth-box").hidden = true;
+    $("app-box").hidden = false;
+    await loadAssets();
+  } catch { /* not signed in */ }
+}
+
+async function loadAssets() {
+  const assets = await api("/assets");
+  if (!assets.length) { $("assets").textContent = "nothing yet"; return; }
+  $("assets").innerHTML = "";
+  for (const a of assets) {
+    const el = document.createElement("div");
+    el.className = "item";
+    el.innerHTML = `<b>${a.name}</b><br><span class="muted">${a.triangles.toLocaleString()}
+      triangles · ${(a.size_bytes/1024).toFixed(0)} KB</span>`;
+    el.onclick = () => openViewer(a);
+    $("assets").appendChild(el);
+  }
+}
+
+function openViewer(asset) {
+  if (!asset.has_viewer) { $("empty").textContent = "this asset has no viewer page"; return; }
+  $("empty").hidden = true;
+  const frame = $("viewer");
+  frame.hidden = false;
+  frame.src = `/assets/${asset.id}/file/viewer`;
+}
+
+$("btn-run").onclick = async () => {
+  $("btn-run").disabled = true;
+  $("note").textContent = "";
+  try {
+    const kind = $("kind").value;
+    const params = kind === "shape"
+      ? { shape: $("shape").value, resolution: 96 }
+      : kind === "planet" ? { radius: 60, seed: 7, canyon: true } : { prompt: "a ceramic teapot" };
+    const job = await api("/jobs", { method: "POST", body: JSON.stringify({ kind, params }) });
+    $("status").textContent = job.status;
+    await follow(job.id);
+  } catch (e) {
+    $("status").textContent = "failed";
+    $("note").textContent = e.message;
+  } finally { $("btn-run").disabled = false; }
+};
+
+function follow(jobId) {
+  return new Promise((resolve) => {
+    const source = new EventSource(`/jobs/${jobId}/events`);
+    source.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      $("status").textContent = data.status + (data.stage ? ` · ${data.stage}` : "");
+      $("bar").style.width = Math.round((data.progress || 0) * 100) + "%";
+      if (["succeeded", "failed", "cancelled"].includes(data.status)) {
+        source.close();
+        if (data.error) $("note").textContent = data.error;
+        loadAssets().then(resolve);
+      }
+    };
+    source.onerror = () => { source.close(); resolve(); };
+  });
+}
+
+boot();
+</script>
+</body>
+</html>
