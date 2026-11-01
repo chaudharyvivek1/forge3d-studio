@@ -34,6 +34,13 @@ from .models import (
 )
 from .worker import KINDS
 
+# Create the schema at import as well as at startup: the statements are
+# `IF NOT EXISTS`, and without this any code path that touches the API before the
+# lifespan runs (a test client used without `with`, an ASGI bridge, a script)
+# fails with a raw "no such table" 500 instead of working.
+get_settings().ensure_dirs()
+db.init_db()
+
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
@@ -58,7 +65,7 @@ async def lifespan(application: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="forge3d-studio",
-    version="0.1.0",
+    version="0.1.1",
     description=(
         "The product surface around forge3d: accounts, a job queue, an asset "
         "library and shareable scene pages. Geometry and validation are done by "
