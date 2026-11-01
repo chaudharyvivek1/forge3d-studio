@@ -1,0 +1,291 @@
+"""API tests — the seven acceptance criteria from the scope, as executable checks.
+
+The worker is not started here; each test drives `Worker.process_one()` directly so
+"a job finished" is a fact rather than a race.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from fastapi.testclient import TestClient
+
+from forge3d_studio import config, db, storage
+from forge3d_studio.api import app
+from forge3d_studio.worker import Worker
+
+
+@pytest.fixture
+def studio(tmp_path, monkeypatch):
+    monkeypatch.setenv("STUDIO_DATA_DIR", str(tmp_path / "studio"))
+    monkeypatch.setenv("STUDIO_DEV_MODE", "true")
+    monkeypatch.setenv("STUDIO_STARTING_CREDITS", "100")
+    monkeypatch.setenv("STUDIO_WORKERS", "0")
+    config._settings = None
+    config.get_settings(refresh=True)
+    db.init_db()
+
+    app.state.start_worker = False          # tests drive the queue themselves
+    app.state.worker = None
+    with TestClient(app) as client:
+        yield client
+    config._settings = None
+
+
+def sign_in(client) -> dict:
+    start = client.post("/auth/request", json={"email": "maker@example.com"})
+    assert start.status_code == 200, start.text
+    token = start.json()["dev_token"]
+    assert token, "dev mode must return the token"
+    done = client.get(f"/auth/callback?token={token}")
+    assert done.status_code == 200, done.text
+    return client.get("/me").json()
+
+
+def run_queue() -> int:
+    """Drain the queue synchronously. Returns how many jobs ran."""
+    worker = Worker()
+    count = 0
+    while worker.process_one():
+        count += 1
+        if count > 10:
+            raise AssertionError("queue did not drain")
+    return count
+
+
+# --- 1. it is alive ------------------------------------------------------
+def test_healthz(studio):
+    body = studio.get("/healthz").json()
+    assert body["ok"] is True
+    assert body["service"] == "forge3d-studio"
+
+
+def test_kinds_are_advertised_with_their_cost(studio):
+    kinds = {k["kind"]: k for k in studio.get("/kinds").json()}
+    assert kinds["shape"]["cost"] == 0
+    assert kinds["provider"]["cost"] > 0, "a paid kind must declare its cost"
+
+
+# --- 2. auth -------------------------------------------------------------
+def test_a_magic_link_signs_you_in(studio):
+    user = sign_in(studio)
+    assert user["email"] == "maker@example.com"
+    assert user["credits"] == 100
+
+
+def test_endpoints_require_a_session(studio):
+    assert studio.get("/me").status_code == 401
+    assert studio.get("/jobs").status_code == 401
+    assert studio.post("/jobs", json={"kind": "shape"}).status_code == 401
+
+
+def test_a_login_token_is_single_use(studio):
+    token = studio.post("/auth/request",
+                        json={"email": "once@example.com"}).json()["dev_token"]
+    assert studio.get(f"/auth/callback?token={token}").status_code == 200
+    assert studio.get(f"/auth/callback?token={token}").status_code == 400
+
+
+def test_logout_ends_the_session(studio):
+    sign_in(studio)
+    assert studio.get("/me").status_code == 200
+    studio.post("/auth/logout")
+    assert studio.get("/me").status_code == 401
+
+
+# --- 3. the whole pipeline: submit -> worker -> asset --------------------
+def test_a_shape_job_produces_a_downloadable_asset(studio):
+    sign_in(studio)
+    submitted = studio.post("/jobs", json={
+        "kind": "shape", "params": {"shape": "torus_knot", "resolution": 48},
+    })
+    assert submitted.status_code == 201, submitted.text
+    job = submitted.json()
+    assert job["status"] == "queued"
+
+    assert run_queue() == 1
+
+    finished = studio.get(f"/jobs/{job['id']}").json()
+    assert finished["status"] == "succeeded", finished
+    assert finished["progress"] == 1.0
+    assert finished["asset_id"]
+
+    asset = studio.get(f"/assets/{finished['asset_id']}").json()
+    assert asset["triangles"] > 0
+    assert asset["has_glb"] is True
+    assert asset["validation"], "the engine's validation report must be stored"
+
+    glb = studio.get(f"/assets/{asset['id']}/file/glb")
+    assert glb.status_code == 200
+    assert glb.content[:4] == b"glTF", "not a binary glTF file"
+
+
+def test_a_planet_job_runs_end_to_end(studio):
+    sign_in(studio)
+    job = studio.post("/jobs", json={
+        "kind": "planet", "params": {"radius": 30, "seed": 3, "subdivisions": 3,
+                                     "texture_resolution": 0},
+    }).json()
+    run_queue()
+    finished = studio.get(f"/jobs/{job['id']}").json()
+    assert finished["status"] == "succeeded", finished
+    assert studio.get(f"/assets/{finished['asset_id']}").json()["triangles"] > 0
+
+
+def test_a_failing_job_is_recorded_not_raised(studio):
+    sign_in(studio)
+    job = studio.post("/jobs", json={
+        "kind": "shape", "params": {"shape": "no-such-shape"},
+    }).json()
+    run_queue()
+    finished = studio.get(f"/jobs/{job['id']}").json()
+    assert finished["status"] == "failed"
+    assert finished["error"]
+
+
+# --- 4. the cost guard fires before the money is spent -------------------
+def test_a_paid_job_is_refused_before_it_is_submitted(studio):
+    user = sign_in(studio)
+    with db.connect() as conn:
+        conn.execute("UPDATE users SET credits = 1 WHERE id = ?", (user["id"],))
+
+    refused = studio.post("/jobs", json={"kind": "provider", "params": {"prompt": "x"}})
+    assert refused.status_code == 402, refused.text
+    assert "not enough credits" in refused.json()["detail"]
+
+    # Nothing was queued, and nothing was charged.
+    assert studio.get("/jobs").json() == []
+    assert studio.get("/me").json()["credits"] == 1
+
+
+def test_credits_are_reserved_when_a_paid_job_is_accepted(studio):
+    user = sign_in(studio)
+    accepted = studio.post("/jobs", json={"kind": "provider", "params": {"prompt": "x"}})
+    assert accepted.status_code == 201
+    assert studio.get("/me").json()["credits"] == user["credits"] - accepted.json()["cost"]
+
+
+def test_a_failed_paid_job_is_refunded(studio):
+    user = sign_in(studio)
+    job = studio.post("/jobs", json={"kind": "provider",
+                                     "params": {"prompt": "x"}}).json()
+    charged = studio.get("/me").json()["credits"]
+    assert charged == user["credits"] - job["cost"]
+
+    run_queue()   # no provider key is configured, so this must fail
+
+    finished = studio.get(f"/jobs/{job['id']}").json()
+    assert finished["status"] == "failed"
+    assert studio.get("/me").json()["credits"] == user["credits"], "not refunded"
+
+
+# --- 5. idempotent submission -------------------------------------------
+def test_the_same_idempotency_key_does_not_create_two_jobs(studio):
+    sign_in(studio)
+    payload = {"kind": "shape", "params": {"shape": "twisted_prism"},
+               "idempotency_key": "abc-123"}
+    first = studio.post("/jobs", json=payload).json()
+    second = studio.post("/jobs", json=payload).json()
+    assert first["id"] == second["id"]
+    assert len(studio.get("/jobs").json()) == 1
+
+
+# --- 6. cancellation ----------------------------------------------------
+def test_a_queued_job_can_be_cancelled(studio):
+    sign_in(studio)
+    job = studio.post("/jobs", json={"kind": "shape",
+                                     "params": {"shape": "spring"}}).json()
+    cancelled = studio.post(f"/jobs/{job['id']}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+    assert run_queue() == 0, "a cancelled job must not be picked up"
+
+
+def test_cancelling_a_finished_job_is_refused(studio):
+    sign_in(studio)
+    job = studio.post("/jobs", json={"kind": "shape",
+                                     "params": {"shape": "spring", "resolution": 32}}).json()
+    run_queue()
+    assert studio.post(f"/jobs/{job['id']}/cancel").status_code == 409
+
+
+# --- 7. scenes and export ----------------------------------------------
+def _make_asset(studio, shape: str) -> str:
+    job = studio.post("/jobs", json={
+        "kind": "shape", "params": {"shape": shape, "resolution": 40, "name": shape},
+    }).json()
+    run_queue()
+    return studio.get(f"/jobs/{job['id']}").json()["asset_id"]
+
+
+def test_a_scene_exports_to_one_html_page(studio):
+    sign_in(studio)
+    a = _make_asset(studio, "torus_knot")
+    b = _make_asset(studio, "twisted_prism")
+
+    scene = studio.post("/scenes", json={
+        "name": "Two Bodies",
+        "items": [{"asset_id": a, "position": [0, 0, 0]},
+                  {"asset_id": b, "position": [12, 2, 0], "scale": 0.8}],
+    })
+    assert scene.status_code == 201, scene.text
+    scene_id = scene.json()["id"]
+
+    exported = studio.post(f"/scenes/{scene_id}/export")
+    assert exported.status_code == 200, exported.text
+    body = exported.json()
+    assert body["ok"] is True, body
+    assert body["size_bytes"] > 10_000
+
+    page = studio.get(f"/assets/{body['asset_id']}/file/viewer")
+    assert page.status_code == 200
+    html = page.text
+    assert html.count("data:model/gltf-binary") == 2, "both models must be embedded"
+    assert "Two Bodies" in html
+
+
+def test_a_scene_cannot_reference_someone_elses_asset(studio):
+    sign_in(studio)
+    mine = _make_asset(studio, "spring")
+
+    other = TestClient(app)
+    start = other.post("/auth/request", json={"email": "other@example.com"}).json()
+    other.get(f"/auth/callback?token={start['dev_token']}")
+
+    attempt = other.post("/scenes", json={
+        "name": "theirs", "items": [{"asset_id": mine}],
+    })
+    assert attempt.status_code == 400
+    assert "unknown asset ids" in attempt.json()["detail"]
+
+
+# --- isolation ----------------------------------------------------------
+def test_assets_are_not_visible_across_users(studio):
+    sign_in(studio)
+    mine = _make_asset(studio, "bumpy_sphere")
+
+    other = TestClient(app)
+    start = other.post("/auth/request", json={"email": "nosy@example.com"}).json()
+    other.get(f"/auth/callback?token={start['dev_token']}")
+
+    assert other.get(f"/assets/{mine}").status_code == 404
+    assert other.get(f"/assets/{mine}/file/glb").status_code == 404
+
+
+def test_stored_paths_cannot_escape_the_root(studio):
+    with pytest.raises(ValueError):
+        storage.resolve("../../etc/passwd")
+
+
+def test_the_job_event_stream_reports_terminal_state(studio):
+    sign_in(studio)
+    job = studio.post("/jobs", json={"kind": "shape",
+                                     "params": {"shape": "spring", "resolution": 32}}).json()
+    run_queue()
+    with studio.stream("GET", f"/jobs/{job['id']}/events") as response:
+        payloads = [json.loads(line[len("data: "):])
+                    for line in response.iter_lines() if line.startswith("data: ")]
+    assert payloads, "the stream produced nothing"
+    assert payloads[-1]["status"] == "succeeded"
