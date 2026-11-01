@@ -98,9 +98,21 @@ def new_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
+#: Databases whose schema this process has already created. Checking a set is
+#: cheaper than `CREATE TABLE IF NOT EXISTS` on every connection, and keying it by
+#: path means a settings change (a test, a second workdir) still gets a schema.
+_INITIALISED: set[str] = set()
+
+
 @contextmanager
 def connect(path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
-    """A connection with row access by name, committed on success."""
+    """A connection with row access by name, schema guaranteed.
+
+    The schema is created on first use of each database file, not only at startup:
+    otherwise anything that touches the API before the lifespan runs — a test
+    client used without `with`, an ASGI bridge, a one-off script — fails with a
+    raw "no such table" instead of working.
+    """
     db_path = Path(path or get_settings().db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
@@ -109,6 +121,10 @@ def connect(path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
+        key = str(db_path.resolve())
+        if key not in _INITIALISED:
+            conn.executescript(SCHEMA)
+            _INITIALISED.add(key)
         yield conn
     finally:
         conn.close()
@@ -276,19 +292,32 @@ def job_is_cancelled(conn: sqlite3.Connection, job_id: str) -> bool:
 
 
 def request_cancel(conn: sqlite3.Connection, job_id: str, user_id: str) -> bool:
-    """Mark for cancellation. A queued job is cancelled outright."""
+    """Mark for cancellation.
+
+    A **queued** job is cancelled outright and its credits are refunded: the
+    provider was never contacted, so charging for it is simply taking money for
+    nothing. The conditional UPDATE is what makes the refund safe — only the
+    caller whose UPDATE matched gets to refund, so a double cancel cannot refund
+    twice.
+
+    A **running** job is only flagged. Credits are not refunded automatically
+    because the provider may already have been charged for work it performed;
+    the worker refunds if the job fails without producing anything.
+    """
     row = conn.execute(
-        "SELECT status FROM jobs WHERE id = ? AND user_id = ?", (job_id, user_id)
+        "SELECT status, cost FROM jobs WHERE id = ? AND user_id = ?", (job_id, user_id)
     ).fetchone()
     if row is None:
         return False
     if row["status"] == "queued":
-        conn.execute(
+        claimed = conn.execute(
             """UPDATE jobs SET status = 'cancelled', finished_at = ?, stage = 'cancelled'
                WHERE id = ? AND status = 'queued'""",
             (time.time(), job_id),
-        )
-        return True
+        ).rowcount
+        if claimed == 1 and row["cost"]:
+            refund_credits(conn, user_id, int(row["cost"]))
+        return claimed == 1
     if row["status"] == "running":
         update_job(conn, job_id, cancel_requested=1)
         return True
