@@ -5,5 +5,5 @@ mesh comes from the pinned forge3d package, and every validation report is the
 engine's own.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = ["__version__"]
