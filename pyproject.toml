@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge3d-studio"
+version = "0.1.0"
+description = "The product surface around forge3d: accounts, a job queue, an asset library and shareable scene pages."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Vivek Chaudhary" }]
+keywords = ["forge3d", "3d", "studio", "fastapi", "threejs"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+dependencies = [
+  # The engine. Pinned to a minor series on purpose: studio calls its public
+  # API, and an unpinned engine would let a generation change break the product
+  # without a release here.
+  "forge3d>=0.6.5,<0.7",
+  "fastapi>=0.110",
+  "uvicorn>=0.30",
+  "pydantic>=2.6",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.5"]
+
+[project.scripts]
+forge3d-studio = "forge3d_studio.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+forge3d_studio = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:forge3d_studio.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# `user: dict = Depends(current_user)` is the documented FastAPI idiom; the rule
+# exists to catch mutable-default bugs, which this is not.
+"src/forge3d_studio/api.py" = ["B008"]
