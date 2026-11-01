@@ -289,3 +289,39 @@ def test_the_job_event_stream_reports_terminal_state(studio):
                     for line in response.iter_lines() if line.startswith("data: ")]
     assert payloads, "the stream produced nothing"
     assert payloads[-1]["status"] == "succeeded"
+
+
+# --- regressions found by using the product -----------------------------
+def test_cancelling_a_queued_paid_job_refunds_it(studio):
+    """The provider was never contacted, so the credits must come back."""
+    user = sign_in(studio)
+    job = studio.post("/jobs", json={"kind": "provider",
+                                     "params": {"prompt": "x"}}).json()
+    assert studio.get("/me").json()["credits"] == user["credits"] - job["cost"]
+
+    assert studio.post(f"/jobs/{job['id']}/cancel").json()["status"] == "cancelled"
+    assert studio.get("/me").json()["credits"] == user["credits"], "credits were not refunded"
+
+
+def test_cancelling_twice_refunds_once(studio):
+    user = sign_in(studio)
+    job = studio.post("/jobs", json={"kind": "provider",
+                                     "params": {"prompt": "x"}}).json()
+    studio.post(f"/jobs/{job['id']}/cancel")
+    assert studio.post(f"/jobs/{job['id']}/cancel").status_code == 409
+    assert studio.get("/me").json()["credits"] == user["credits"], "double refund"
+
+
+def test_the_api_works_before_the_lifespan_runs(tmp_path, monkeypatch):
+    """A client used without `with`, or a script, must not hit 'no such table'."""
+    monkeypatch.setenv("STUDIO_DATA_DIR", str(tmp_path / "fresh"))
+    monkeypatch.setenv("STUDIO_DEV_MODE", "true")
+    config._settings = None
+    config.get_settings(refresh=True)
+    try:
+        client = TestClient(app)          # deliberately not a context manager
+        assert client.get("/healthz").status_code == 200
+        assert client.post("/auth/request",
+                           json={"email": "a@b.com"}).status_code == 200
+    finally:
+        config._settings = None
