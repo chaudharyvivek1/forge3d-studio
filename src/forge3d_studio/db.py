@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     asset_id          TEXT,
     idempotency_key   TEXT,
     cancel_requested  INTEGER NOT NULL DEFAULT 0,
+    refunded          INTEGER NOT NULL DEFAULT 0,
+    needs_review      INTEGER NOT NULL DEFAULT 0,
     created_at        REAL NOT NULL,
     started_at        REAL,
     finished_at       REAL
@@ -124,15 +126,35 @@ def connect(path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
         key = str(db_path.resolve())
         if key not in _INITIALISED:
             conn.executescript(SCHEMA)
+            _migrate(conn)
             _INITIALISED.add(key)
         yield conn
     finally:
         conn.close()
 
 
+#: Columns added after the first release. `CREATE TABLE IF NOT EXISTS` will not
+#: add them to a database that already exists, so they are applied explicitly.
+MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "jobs": [
+        ("refunded", "INTEGER NOT NULL DEFAULT 0"),
+        ("needs_review", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, columns in MIGRATIONS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
 def init_db(path: Path | str | None = None) -> None:
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +299,7 @@ def claim_next_job(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 def update_job(conn: sqlite3.Connection, job_id: str, **fields) -> None:
     allowed = {"status", "progress", "stage", "error", "asset_id",
-               "finished_at", "cancel_requested"}
+               "finished_at", "cancel_requested", "refunded", "needs_review"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"cannot update job fields: {sorted(unknown)}")
