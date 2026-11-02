@@ -139,6 +139,14 @@ it holds no credits.
 `STUDIO_STARTING_CREDITS` and `STUDIO_SECRET` are still read so an old database
 and an old `.env` keep working, but neither has any effect now.
 
+## Orphan reservations
+
+A reservation created just before a crash has no job attached, and nothing else
+would ever find it. `recover_orphan_reservations` walks **every page** of the
+application's reservations at startup and releases those with no local job, after
+`STUDIO_ORPHAN_GRACE_SECONDS`. A reservation with any job row is left alone, and
+a platform outage ends the sweep rather than hammering a dead service.
+
 ## Reliability behaviour
 
 A job is claimed with a lease. The worker renews it on a timer, and a worker

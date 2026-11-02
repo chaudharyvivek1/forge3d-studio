@@ -261,7 +261,7 @@ def recover_orphan_reservations(central: CentralClient, settings) -> dict[str, i
     """
     grace = float(getattr(settings, "orphan_grace_seconds", 300.0))
     cutoff = time.time() - grace
-    counts = {"candidates": 0, "released": 0, "skipped": 0}
+    counts = {"candidates": 0, "released": 0, "skipped": 0, "failed": 0}
 
     try:
         orphans = central.reservations_for_app(state="reserved", older_than=cutoff)
@@ -274,6 +274,14 @@ def recover_orphan_reservations(central: CentralClient, settings) -> dict[str, i
 
     for reservation in orphans:
         counts["candidates"] += 1
+
+        # Defence in depth: the query asked for `reserved`, but a page could
+        # have been produced by a platform that ignores the filter, and a
+        # settled or flagged reservation must never be released here.
+        if reservation.state != "reserved":
+            counts["skipped"] += 1
+            continue
+
         with db.connect() as conn:
             job = db.job_for_reservation(conn, reservation.id)
         if job is not None:
@@ -282,11 +290,21 @@ def recover_orphan_reservations(central: CentralClient, settings) -> dict[str, i
             continue
         try:
             central.release(reservation.id, reason="orphan_no_job")
+        except CentralUnavailable:
+            # The platform went away mid-sweep. Stop: the rest of the list is
+            # still valid and a later run will pick it up.
+            counts["failed"] += 1
+            logger.warning(
+                "orphan sweep stopped early: platform unreachable after %s of %s",
+                counts["candidates"],
+                len(orphans),
+            )
+            return counts
         except CentralError as exc:
+            counts["failed"] += 1
             logger.warning(
                 "orphan sweep: could not release %s (%s)", reservation.id, exc
             )
-            counts["skipped"] += 1
             continue
         counts["released"] += 1
         logger.warning(
@@ -298,7 +316,13 @@ def recover_orphan_reservations(central: CentralClient, settings) -> dict[str, i
         )
 
     if counts["candidates"]:
-        logger.info("orphan sweep finished: %s", counts)
+        logger.info(
+            "orphan sweep finished: %d processed, %d released, %d skipped, %d failed",
+            counts["candidates"],
+            counts["released"],
+            counts["skipped"],
+            counts["failed"],
+        )
     return counts
 
 

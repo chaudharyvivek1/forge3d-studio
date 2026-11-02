@@ -1,8 +1,12 @@
 name: integration
 
-# The protected workflow. Unlike `ci`, this one refuses to run without the
-# private platform credential: a green build that silently skipped every
-# cross-repository test would be worse than a red one.
+# The cross-repository contract. It refuses to run without the private platform
+# package: a green build that skipped every integration test would be worse than
+# a red one.
+#
+# Fork pull requests never receive repository secrets, so this workflow does not
+# run for them — and it says so out loud rather than reporting a pass it did not
+# earn. Maintainers run it from the branch after review.
 on:
   push:
     branches: [main]
@@ -12,6 +16,9 @@ on:
 jobs:
   cross-repository:
     name: studio x billing-auth
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,16 +45,34 @@ jobs:
           pip install "forge3d-billing-auth @ git+https://x-access-token:${BILLING_AUTH_TOKEN}@github.com/chaudharyvivek1/forge3d-billing-auth.git"
           pip install -e ".[dev]"
 
-      - name: Prove the platform package is importable
-        run: python -c "import billing_auth; print('billing-auth', billing_auth.__version__)"
+      - name: Prove the right platform package is installed
+        run: |
+          python - <<'PY'
+          import billing_auth
+          from billing_auth.billing import BillingService
+          print("billing_auth", billing_auth.__version__, "from", billing_auth.__file__)
+          assert hasattr(BillingService, "page_for_app"), "stale platform package"
+          PY
 
-      - name: Integration tests (skips are failures)
+      - name: Integration tests (a skip is a failure)
         env:
           REQUIRE_INTEGRATION: "1"
         run: |
-          pytest -q tests/test_central_client.py tests/test_integration_central.py tests/test_hardening.py
+          pytest -q -m "not slow" \
+            tests/test_central_client.py \
+            tests/test_integration_central.py \
+            tests/test_hardening.py \
+            tests/test_pagination_recovery.py
 
-      - name: Full suite
-        env:
-          REQUIRE_INTEGRATION: "1"
-        run: pytest -q
+  fork-notice:
+    name: integration skipped (fork)
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say plainly that nothing ran
+        run: |
+          echo "::notice::Integration tests did not run for this fork pull request."
+          echo "::notice::Secrets are not exposed to forks. A maintainer must run"
+          echo "::notice::the integration workflow on this branch before merging."

@@ -40,6 +40,20 @@ PRICES = {"shape": 0, "planet": 0, "provider": 25}
 from billing_auth.service import ServiceSettings, create_app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+#: The platform capability these tests depend on. If an older build of the
+#: private package is installed — which happens easily with editable installs —
+#: the tests fail loudly here instead of skipping or passing against a version
+#: that does not have the endpoint.
+REQUIRED_PLATFORM_CAPABILITY = "page_for_app"
+
+if not hasattr(billing_auth.BillingService, REQUIRED_PLATFORM_CAPABILITY):
+    raise RuntimeError(
+        "the installed billing_auth is too old for these tests: "
+        f"BillingService.{REQUIRED_PLATFORM_CAPABILITY} is missing "
+        f"(loaded from {billing_auth.__file__}, version {billing_auth.__version__}). "
+        "Install the current private package before running the suite."
+    )
+
 APP_ID = "forge3d-studio"
 SERVICE_TOKEN = "test-service-token"
 OTHER_TOKEN = "other-app-token"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forge3d-studio"
-version = "0.2.1"
+version = "0.2.2"
 description = "The product surface around forge3d: accounts, a job queue, an asset library and shareable scene pages."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,6 +41,10 @@ where = ["src"]
 forge3d_studio = ["static/*"]
 
 [tool.pytest.ini_options]
+# `slow` marks tests that make hundreds of real HTTP round trips through the
+# in-process platform. They are correct, just expensive: the unit workflow skips
+# them, the regression workflow runs them.
+markers = ["slow: takes more than a few seconds (hundreds of round trips)"]
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["error::DeprecationWarning:forge3d_studio.*"]

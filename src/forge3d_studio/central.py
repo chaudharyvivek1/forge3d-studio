@@ -25,6 +25,7 @@ import json
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -307,20 +308,57 @@ class CentralClient:
         return [self._reservation(row) for row in payload]
 
     def reservations_for_app(
-        self, *, state: str | None = None, older_than: float | None = None, limit: int = 200
+        self,
+        *,
+        state: str | None = None,
+        older_than: float | None = None,
+        page_size: int = 200,
+        max_pages: int = 500,
     ) -> list[ReservationView]:
-        """Every reservation this application made, across all its accounts.
+        """Every reservation this application made, across every page.
 
-        Used by the orphan sweep, which has to look at reservations that no
-        local job ever claimed and therefore belong to no known account flow.
+        The old version read one page and called it the whole set, which meant
+        everything past the first 200 rows was invisible to the orphan sweep —
+        the reservations most in need of recovery were exactly the ones it could
+        not see.
+
+        Two failure modes are refused rather than papered over: a cursor that
+        repeats (which would loop forever) and a page count beyond `max_pages`
+        (which would mean the sweep is not converging). Both raise, so a caller
+        never mistakes a partial read for a complete one.
         """
-        query = [f"limit={limit}"]
-        if state:
-            query.append(f"state={state}")
-        if older_than is not None:
-            query.append(f"older_than={older_than}")
-        payload = self._call("GET", f"/v1/service/reservations?{'&'.join(query)}")
-        return [self._reservation(row) for row in payload]
+        collected: list[ReservationView] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+
+        for _ in range(max_pages):
+            query = [f"limit={page_size}"]
+            if state:
+                query.append(f"state={state}")
+            if older_than is not None:
+                query.append(f"older_than={older_than}")
+            if cursor:
+                query.append(f"cursor={urllib.parse.quote(cursor, safe='')}")
+
+            payload = self._call(
+                "GET", f"/v1/service/reservations/page?{'&'.join(query)}"
+            )
+            collected.extend(self._reservation(row) for row in payload.get("items") or [])
+
+            next_cursor = payload.get("next_cursor")
+            if not next_cursor:
+                return collected
+            if next_cursor in seen:
+                raise CentralError(
+                    "the platform returned a pagination cursor it had already "
+                    "returned; refusing to loop"
+                )
+            seen.add(next_cursor)
+            cursor = next_cursor
+
+        raise CentralError(
+            f"reservation listing did not finish within {max_pages} pages"
+        )
 
     def _action(self, reservation_id: str, action: str, body: dict | None = None) -> tuple[str, bool]:
         payload = self._call(

@@ -99,7 +99,7 @@ async def lifespan(application: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="forge3d-studio",
-    version="0.2.1",
+    version="0.2.2",
     description=(
         "The product surface around forge3d: accounts, a job queue, an asset "
         "library and shareable scene pages. Geometry and validation are done by "
@@ -125,7 +125,7 @@ async def limit_payload(request: Request, call_next):
             too_big = False
         if too_big:
             return JSONResponse(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 content={"detail": "request body is too large"},
             )
     return await call_next(request)
@@ -385,7 +385,7 @@ def submit_job(
     raw_params = json.dumps(payload.params or {})
     if len(raw_params) > settings.max_params_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"generation parameters are too large ({len(raw_params)} bytes)",
         )
 

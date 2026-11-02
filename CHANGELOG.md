@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.2.2] — 2026-11-02
+
+### Fixed — orphan recovery only ever saw the first 200 reservations
+
+`reservations_for_app()` read one page and returned it as the whole set, so every
+orphan past row 200 was invisible to the sweep — which is precisely the backlog
+that needed recovering. It now follows the platform's cursor to exhaustion.
+
+The client refuses two failure modes rather than papering over them: a cursor
+that repeats (which would loop forever) and more than `max_pages` pages (which
+would mean the sweep is not converging). Both raise, so a partial read is never
+mistaken for a complete one.
+
+### Fixed — the sweep could not stop cleanly
+
+A platform outage during a release now ends the sweep instead of hammering a
+dead service. Per-item rejections are counted as `failed` and the sweep carries
+on. Reservations that are not in `reserved` state are skipped defensively, and a
+reservation with any local job row is still never touched.
+
+### Changed
+
+- `tests/central_fake.py` asserts the installed platform package has the
+  capabilities these tests need. An editable install left pointing at an old
+  checkout used to make the suite pass against the wrong code; it now fails
+  loudly with the path and version it found.
+- Slow tests are marked `slow` and run in the `regression` workflow.
+- CI is split three ways: `unit` (no credential), `integration` (credential
+  required, fails rather than skips), `regression` (everything, nightly).
+
+### Added
+
+- 16 pagination and recovery tests, including 1,001 orphans, page boundaries at
+  199/200/201, per-item release failures, mid-sweep outages, repeated runs and a
+  duplicate-processing check.
+
+### Note
+
+Studio needed no schema change for this release; the pagination work is a query
+concern. Existing jobs keep their reservation references untouched.
+
+
 ## [0.2.1] — 2026-11-02
 
 Hardening found by reviewing v0.2.0 across both repositories.
