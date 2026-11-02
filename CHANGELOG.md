@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.1.2] — 2026-11-01
+
+### Fixed — an uncertain submission was refunded
+
+If a provider accepted a job and we lost the response, the engine reported
+`uncertain`; the worker turned that into an exception and `_fail()` refunded the
+credits. The provider had probably already been charged, so that is a way to get
+paid generation for free.
+
+`uncertain` is now its own job status, not a flavour of `failed`, and it is never
+refunded automatically. The job keeps its credits, is flagged `needs_review`, and
+carries the idempotency key so an operator can reconcile it with the provider.
+
+The refund rule is now explicit rather than incidental:
+
+| outcome | refund | why |
+|---|---|---|
+| cancelled while queued | yes | the provider was never contacted |
+| cancelled while running | no | it may already have been charged |
+| not configured | yes | nothing was sent |
+| provider rejected it | yes | nothing was produced |
+| submission uncertain | **no** | it may exist and have been billed |
+| any other failure, paid | **no** | we cannot prove nothing was charged |
+
+Two supporting changes make that honest:
+
+- **A pre-flight configuration check.** `_require_provider()` runs *before* the
+  network call, so "not configured" is a fact rather than an inference from an
+  error string — and it is the one case where a refund is certainly safe.
+- **Two new job columns**, `refunded` and `needs_review`, exposed on every job in
+  the API. They are added by a migration, because `CREATE TABLE IF NOT EXISTS`
+  does not touch a database that already exists.
+
+### Tests
+
+28 passing (was 23). New: uncertain is not refunded and is flagged for review, a
+rejected submission is refunded, an unexpected exception keeps the credits, a free
+job is never flagged, and an existing database gains the new columns.
+
 ## [0.1.1] — 2026-11-01
 
 Two defects found by using the product rather than reading it.
