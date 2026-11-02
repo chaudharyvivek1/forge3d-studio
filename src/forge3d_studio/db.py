@@ -139,8 +139,25 @@ MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "jobs": [
         ("refunded", "INTEGER NOT NULL DEFAULT 0"),
         ("needs_review", "INTEGER NOT NULL DEFAULT 0"),
+        #: The central platform's reservation. Money is tracked there now; this
+        #: column is how a job and its reservation find each other again.
+        ("reservation_id", "TEXT"),
+    ],
+    "users": [
+        #: Studio's local profile is keyed by the central account id, so a
+        #: profile survives the platform's own changes and never duplicates a
+        #: person who logs in twice.
+        ("central_account_id", "TEXT"),
     ],
 }
+
+#: Indexes added after the first release. `IF NOT EXISTS` is safe to repeat, but
+#: they are listed here rather than in SCHEMA so an existing database gets them.
+INDEX_MIGRATIONS: list[str] = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS users_central "
+    "ON users(central_account_id) WHERE central_account_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS jobs_reservation ON jobs(reservation_id)",
+]
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -149,6 +166,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for name, definition in columns:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+    for statement in INDEX_MIGRATIONS:
+        conn.execute(statement)
 
 
 def init_db(path: Path | str | None = None) -> None:
@@ -170,6 +189,41 @@ def ensure_user(conn: sqlite3.Connection, email: str, starting_credits: int) -> 
         (new_id(), email, starting_credits, time.time()),
     )
     return conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+
+
+def profile_for_central_account(
+    conn: sqlite3.Connection, central_account_id: str, email: str
+) -> sqlite3.Row:
+    """Find or create studio's own profile for a central account.
+
+    The central platform owns the person; studio owns the profile hanging off
+    them (display preferences later, ownership of assets and scenes now). A
+    profile that already exists is reused, which is what keeps generation
+    history attached when the platform's user id is all we start from.
+    """
+    email = email.strip().lower()
+    row = conn.execute(
+        "SELECT * FROM users WHERE central_account_id = ?", (central_account_id,)
+    ).fetchone()
+    if row is not None:
+        return row
+
+    # A v0.1.2 profile with the same email is adopted rather than duplicated.
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    if row is not None:
+        conn.execute(
+            "UPDATE users SET central_account_id = ? WHERE id = ?",
+            (central_account_id, row["id"]),
+        )
+        return conn.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
+
+    user_id = new_id()
+    conn.execute(
+        "INSERT INTO users (id, email, credits, created_at, central_account_id) "
+        "VALUES (?, ?, 0, ?, ?)",
+        (user_id, email, time.time(), central_account_id),
+    )
+    return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
 def create_session(conn: sqlite3.Connection, user_id: str, ttl: int) -> str:
@@ -263,16 +317,36 @@ def create_job(
     provider: str = "local",
     cost: int = 0,
     idempotency_key: str | None = None,
+    reservation_id: str | None = None,
 ) -> sqlite3.Row:
     job_id = new_id()
     conn.execute(
         """INSERT INTO jobs (id, user_id, kind, params, status, provider, cost,
-                             progress, stage, idempotency_key, created_at)
-           VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, 'queued', ?, ?)""",
+                             progress, stage, idempotency_key, reservation_id,
+                             created_at)
+           VALUES (?, ?, ?, ?, 'queued', ?, ?, 0, 'queued', ?, ?, ?)""",
         (job_id, user_id, kind, json.dumps(params), provider, cost,
-         idempotency_key, time.time()),
+         idempotency_key, reservation_id, time.time()),
     )
     return conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+
+
+def job_for_reservation(conn: sqlite3.Connection, reservation_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM jobs WHERE reservation_id = ?", (reservation_id,)
+    ).fetchone()
+
+
+def jobs_with_pending_reservations(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Jobs that hold a reservation and have not reached a terminal state.
+
+    These are what a restart has to reconcile: the money is reserved on the
+    platform, and studio has to find out what actually happened.
+    """
+    return conn.execute(
+        "SELECT * FROM jobs WHERE reservation_id IS NOT NULL "
+        "AND status IN ('queued', 'running') ORDER BY created_at"
+    ).fetchall()
 
 
 def claim_next_job(conn: sqlite3.Connection) -> sqlite3.Row | None:

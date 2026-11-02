@@ -30,6 +30,18 @@ jobs:
           pip install "forge3d @ git+https://github.com/chaudharyvivek1/forge3d.git"
           pip install -e ".[dev]"
 
+      - name: Install the private central platform
+        env:
+          BILLING_AUTH_TOKEN: ${{ secrets.BILLING_AUTH_TOKEN }}
+        run: |
+          # Studio does not depend on this package at runtime — it speaks HTTP.
+          # The integration tests do, so without the secret they are skipped.
+          if [ -n "$BILLING_AUTH_TOKEN" ]; then
+            pip install "forge3d-billing-auth @ git+https://x-access-token:${BILLING_AUTH_TOKEN}@github.com/chaudharyvivek1/forge3d-billing-auth.git"
+          else
+            echo "::warning::BILLING_AUTH_TOKEN is not set — central integration tests will be skipped"
+          fi
+
       - name: Lint
         run: ruff check src tests
 

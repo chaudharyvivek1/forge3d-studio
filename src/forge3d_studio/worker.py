@@ -12,6 +12,7 @@ API and stores what it returns.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import traceback
@@ -19,12 +20,21 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import db, storage
+from .central import (
+    CentralClient,
+    CentralError,
+    client_from_settings,
+)
 from .config import Settings, get_settings
+
+logger = logging.getLogger("forge3d_studio.worker")
 
 #: Kinds a client may submit, their credit cost, and whether they need a provider.
 #:
-#: Cost is charged **before** the work starts (see `db.spend_credits`), so a user
-#: at zero credits cannot reach a paid provider by racing the check.
+#: Cost is reserved on the central platform **before** the work starts, so a
+#: user at zero credits cannot reach a paid provider by racing the check. Studio
+#: does not charge anything itself any more; it only records what the platform
+#: reserved.
 KINDS: dict[str, dict] = {
     "shape": {"cost": 0, "provider": "local",
               "summary": "a parametric shape from the equation library"},
@@ -200,8 +210,13 @@ HANDLERS: dict[str, Callable[[dict, dict, Callable[[float, str], None]], dict]] 
 # the worker
 # ---------------------------------------------------------------------------
 class Worker:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        central: CentralClient | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
+        self.central = central or client_from_settings(self.settings)
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
 
@@ -261,6 +276,10 @@ class Worker:
             db.update_job(conn, job_id, status="succeeded", progress=1.0,
                           stage="done", asset_id=asset["id"], finished_at=time.time())
 
+        # Only now is the spend real. Committing before the asset is stored
+        # would charge for work that never reached the user.
+        self._commit(conn_job)
+
     def _fail(self, job: dict, exc: Exception) -> None:
         """Record the outcome, and decide about money.
 
@@ -283,34 +302,89 @@ class Worker:
         cost = int(job.get("cost") or 0)
         cancelled = isinstance(exc, JobCancelled)
         uncertain = isinstance(exc, UncertainSubmission)
-        safe_to_refund = isinstance(exc, (ProviderNotConfigured, ProviderRejected))
+        safe_to_release = isinstance(exc, (ProviderNotConfigured, ProviderRejected))
 
         if cancelled:
-            status, refund, review = "cancelled", False, False
+            status, review = "cancelled", False
             detail = "cancelled by the client"
+            action = "flag" if cost else None
         elif uncertain:
-            status, refund, review = "uncertain", False, True
+            status, review = "uncertain", True
             detail = str(exc)
-        elif safe_to_refund:
-            status, refund, review = "failed", bool(cost), False
+            action = "flag" if cost else None
+        elif safe_to_release:
+            # Nothing was sent, so the platform can give the credits back.
+            status, review = "failed", False
             detail = str(exc)
+            action = "release" if cost else None
         else:
             # Unknown failure on a paid job: assume the money may be spent.
             status = "failed"
-            refund = False
             review = bool(cost)
             detail = f"{type(exc).__name__}: {exc}"
+            action = "flag" if cost else None
+
+        refunded = False
+        if action and job.get("reservation_id"):
+            refunded = self._settle_money(job, action, detail)
 
         with db.connect() as conn:
-            if refund and cost:
-                db.refund_credits(conn, job["user_id"], cost)
             db.update_job(
                 conn, job["id"], status=status, stage=status, error=detail[:2000],
-                finished_at=time.time(), refunded=1 if refund else 0,
+                finished_at=time.time(), refunded=1 if refunded else 0,
                 needs_review=1 if review else 0,
             )
         if not cancelled and not uncertain:
             traceback.print_exc()
+
+    # -- money ------------------------------------------------------------
+    def _commit(self, job: dict) -> None:
+        """Turn a reservation into a spend. Best effort, but never silent."""
+        reservation_id = job.get("reservation_id")
+        if not reservation_id:
+            return
+        try:
+            self.central.commit(reservation_id)
+        except CentralError as exc:
+            # The work is delivered, so the user keeps it. The reservation is
+            # left reserved, which is the safe direction: money stays held
+            # rather than being handed back for work that was performed.
+            logger.error(
+                "job %s delivered but reservation %s could not be committed: %s",
+                job["id"],
+                reservation_id,
+                exc,
+            )
+            with db.connect() as conn:
+                db.update_job(conn, job["id"], needs_review=1)
+
+    def _settle_money(self, job: dict, action: str, detail: str) -> bool:
+        """Release or flag a reservation. Returns True only if credits came back.
+
+        If the platform cannot be reached the reservation is left alone and the
+        job is flagged. That is deliberate: a reservation released twice is a
+        gift, and one never released is a support ticket.
+        """
+        reservation_id = job["reservation_id"]
+        try:
+            if action == "release":
+                _, changed = self.central.release(
+                    reservation_id, reason=detail[:120] or "failed"
+                )
+                return bool(changed)
+            self.central.flag(reservation_id, reason=detail[:120] or "uncertain")
+            return False
+        except CentralError as exc:
+            logger.error(
+                "job %s: could not %s reservation %s: %s",
+                job["id"],
+                action,
+                reservation_id,
+                exc,
+            )
+            with db.connect() as conn:
+                db.update_job(conn, job["id"], needs_review=1)
+            return False
 
     # -- the pool --------------------------------------------------------
     def run_forever(self, poll_seconds: float = 0.5) -> None:

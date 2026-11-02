@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,15 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db, storage
+from .central import (
+    CentralClient,
+    CentralError,
+    CentralUnavailable,
+    InsufficientCredits,
+    InvalidSession,
+    NotEntitled,
+    client_from_settings,
+)
 from .config import get_settings
 from .models import (
     AssetOut,
@@ -32,6 +41,7 @@ from .models import (
     SceneOut,
     UserOut,
 )
+from .reconcile import reconcile_pending
 from .worker import KINDS
 
 # Create the schema at import as well as at startup: the statements are
@@ -47,6 +57,22 @@ async def lifespan(application: FastAPI):
     """Start the DB and the worker pool with the app, and stop them with it."""
     settings = get_settings()
     db.init_db()
+
+    # The central platform is the authority for identity and money. If studio
+    # cannot reach it at boot it still starts — assets, scenes and history stay
+    # readable — but every paid path below fails closed until it comes back.
+    central: CentralClient = getattr(application.state, "central", None) or client_from_settings(
+        settings
+    )
+    application.state.central = central
+
+    try:
+        application.state.reconciled = reconcile_pending(central, settings)
+    except CentralUnavailable:
+        # Starting without reconciliation is safe: nothing is retried, and the
+        # next boot will find the same pending reservations.
+        application.state.reconciled = {"skipped": "central unavailable"}
+
     worker = None
     if getattr(application.state, "start_worker", True):
         from .worker import Worker
@@ -65,7 +91,7 @@ async def lifespan(application: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="forge3d-studio",
-    version="0.1.2",
+    version="0.2.0",
     description=(
         "The product surface around forge3d: accounts, a job queue, an asset "
         "library and shareable scene pages. Geometry and validation are done by "
@@ -90,6 +116,8 @@ def healthz() -> dict:
         "version": app.version,
         "dev_mode": settings.dev_mode,
         "queued_jobs": queued,
+        "central_configured": settings.central_configured,
+        "reconciled": getattr(app.state, "reconciled", None),
     }
 
 
@@ -100,54 +128,123 @@ def list_kinds() -> list[KindOut]:
 
 # ---------------------------------------------------------------------------
 # auth
+#
+# Studio no longer authenticates anyone. It forwards to the central platform,
+# keeps the platform's access token in its own cookie, and asks the platform
+# who a token belongs to. There is no local password, no local session table
+# that grants access, and no local credit balance.
 # ---------------------------------------------------------------------------
+def central_client(request: Request) -> CentralClient:
+    client = getattr(request.app.state, "central", None)
+    if client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="the central platform is not configured",
+        )
+    return client
+
+
+def _unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="authentication is temporarily unavailable, try again shortly",
+    )
+
+
 def current_user(request: Request) -> dict:
+    """Resolve the caller against the central platform, then to a local profile.
+
+    Fails closed: if the platform cannot confirm the session, the request is
+    refused rather than assumed good.
+    """
     settings = get_settings()
     token = request.cookies.get(settings.session_cookie)
     if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="not signed in")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="not signed in"
+        )
+
+    central = central_client(request)
+    try:
+        account = central.verify(token)
+    except CentralUnavailable:
+        raise _unavailable() from None
+    except InvalidSession:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="session expired"
+        ) from None
+
+    if account is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="session expired"
+        )
+
     with db.connect() as conn:
-        row = db.user_for_session(conn, token)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="session expired")
-    return dict(row)
+        profile = db.profile_for_central_account(
+            conn, account["account_id"], account["email"]
+        )
+    return {
+        "id": profile["id"],
+        "email": profile["email"],
+        "central_account_id": account["account_id"],
+    }
 
 
 @app.post("/auth/request", response_model=LoginResponse)
-def request_login(payload: LoginRequest) -> LoginResponse:
-    """Start a magic-link login.
+def request_login(payload: LoginRequest, request: Request) -> LoginResponse:
+    """Ask the platform to email a magic link.
 
-    In dev mode the token comes back in the response, because there is no mail
-    provider. That is a deliberate, documented hole — `STUDIO_DEV_MODE=false`
-    closes it.
+    The link lands on this application's own callback, which is registered with
+    the platform — studio cannot redirect it, and neither can a caller.
     """
-    settings = get_settings()
-    with db.connect() as conn:
-        token = db.create_login_token(conn, payload.email, settings.login_token_ttl_seconds)
-    if settings.dev_mode:
-        return LoginResponse(sent=True, dev_token=token)
-    # A real deployment sends this by email and returns nothing sensitive.
-    return LoginResponse(sent=True, dev_token=None,
-                         note="check your email for the sign-in link")
+    central = central_client(request)
+    try:
+        result = central.request_login(payload.email)
+    except CentralUnavailable:
+        raise _unavailable() from None
+    except CentralError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"could not start sign-in: {exc.detail}",
+        ) from None
+
+    return LoginResponse(
+        sent=bool(result.get("sent")),
+        dev_token=result.get("dev_token"),
+        note=str(result.get("note") or "check your email for the sign-in link"),
+    )
 
 
 @app.get("/auth/callback")
-def login_callback(token: str, response: Response) -> dict:
+def login_callback(token: str, request: Request, response: Response) -> dict:
+    """Trade the platform's single-use link token for a session."""
     settings = get_settings()
+    central = central_client(request)
+    try:
+        session = central.exchange(token)
+    except CentralUnavailable:
+        raise _unavailable() from None
+    except InvalidSession:
+        raise HTTPException(
+            status_code=400, detail="invalid, expired or already used sign-in link"
+        ) from None
+    except CentralError as exc:
+        raise HTTPException(status_code=502, detail=f"sign-in failed: {exc.detail}") from None
+
     with db.connect() as conn:
-        email = db.consume_login_token(conn, token)
-        if email is None:
-            raise HTTPException(status_code=400, detail="invalid or expired token")
-        user = db.ensure_user(conn, email, settings.starting_credits)
-        session = db.create_session(conn, user["id"], settings.session_ttl_seconds)
+        profile = db.profile_for_central_account(
+            conn, session.account_id, session.email
+        )
+
     response.set_cookie(
-        settings.session_cookie, session,
-        httponly=True, samesite="lax", max_age=settings.session_ttl_seconds,
+        settings.session_cookie,
+        session.access_token,
+        httponly=True,
+        samesite="lax",
+        max_age=settings.session_ttl_seconds,
         secure=not settings.dev_mode,
     )
-    return {"ok": True, "user_id": user["id"], "email": user["email"]}
+    return {"ok": True, "user_id": profile["id"], "email": profile["email"]}
 
 
 @app.post("/auth/logout")
@@ -155,15 +252,35 @@ def logout(request: Request, response: Response) -> dict:
     settings = get_settings()
     token = request.cookies.get(settings.session_cookie)
     if token:
-        with db.connect() as conn:
-            db.delete_session(conn, token)
+        # A logout that cannot reach the platform still clears the cookie; the
+        # platform's own expiry is the backstop.
+        with suppress(CentralError):
+            central_client(request).revoke(token)
     response.delete_cookie(settings.session_cookie)
     return {"ok": True}
 
 
 @app.get("/me", response_model=UserOut)
-def me(user: dict = Depends(current_user)) -> UserOut:
-    return UserOut(id=user["id"], email=user["email"], credits=user["credits"])
+def me(request: Request, user: dict = Depends(current_user)) -> UserOut:
+    central = central_client(request)
+    try:
+        credits = central.balance(user["central_account_id"])
+        features = central.entitlements(user["central_account_id"])
+    except CentralUnavailable:
+        raise _unavailable() from None
+    except CentralError:
+        credits, features = 0, []
+
+    # Studio only knows about itself. Listing the other applications a person
+    # can reach is the platform's job, not ours, and is deliberately not guessed
+    # at here.
+    return UserOut(
+        id=user["id"],
+        email=user["email"],
+        credits=credits,
+        apps=[get_settings().auth_billing_app_id],
+        entitlements=features,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -176,42 +293,89 @@ def _job_out(row: Any) -> JobOut:
         error=row["error"], asset_id=row["asset_id"], created_at=row["created_at"],
         started_at=row["started_at"], finished_at=row["finished_at"],
         refunded=bool(row["refunded"]), needs_review=bool(row["needs_review"]),
+        reservation_id=row["reservation_id"],
     )
 
 
 @app.post("/jobs", response_model=JobOut, status_code=status.HTTP_201_CREATED)
-def submit_job(payload: JobSubmit, user: dict = Depends(current_user)) -> JobOut:
+def submit_job(
+    payload: JobSubmit, request: Request, user: dict = Depends(current_user)
+) -> JobOut:
+    """Reserve on the platform, then queue locally.
+
+    Order matters and is not negotiable: entitlement, then reservation, then the
+    job row. A job is never created that is not backed by a reservation, and a
+    provider is never called for a job that is not queued.
+    """
     info = KINDS.get(payload.kind)
     if info is None:
         raise HTTPException(status_code=400, detail=f"unknown kind {payload.kind!r}")
     cost = int(info["cost"])
 
-    with db.connect() as conn:
-        if payload.idempotency_key:
-            existing = conn.execute(
-                "SELECT * FROM jobs WHERE user_id = ? AND idempotency_key = ?",
-                (user["id"], payload.idempotency_key),
-            ).fetchone()
-            if existing:
-                return _job_out(existing)
+    settings = get_settings()
+    central = central_client(request)
+    account_id = user["central_account_id"]
 
-        # Reserve before creating the job. If this fails, nothing was queued and
-        # no provider was contacted.
-        if not db.spend_credits(conn, user["id"], cost):
+    try:
+        if settings.require_entitlement and not central.is_entitled(
+            account_id, payload.kind
+        ):
             raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail=(f"not enough credits: {payload.kind} costs {cost}, "
-                        f"you have {user['credits']}"),
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"your account is not entitled to {payload.kind} generation",
             )
+        key = payload.idempotency_key or db.new_id()
+        reservation = central.create_reservation(
+            account_id=account_id,
+            kind=payload.kind,
+            cost=cost,
+            idempotency_key=key,
+            metadata={"params": payload.params},
+        )
+    except HTTPException:
+        raise
+    except InsufficientCredits as exc:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=exc.detail
+        ) from None
+    except NotEntitled as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=exc.detail
+        ) from None
+    except InvalidSession:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="session expired"
+        ) from None
+    except CentralUnavailable:
+        raise _unavailable() from None
+    except CentralError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"could not reserve credits: {exc.detail}",
+        ) from None
+
+    with db.connect() as conn:
+        # A retried submit resolves to the job this reservation already made.
+        existing = db.job_for_reservation(conn, reservation.id)
+        if existing is not None:
+            return _job_out(existing)
 
         try:
             job = db.create_job(
-                conn, user_id=user["id"], kind=payload.kind, params=payload.params,
-                provider=info["provider"], cost=cost,
-                idempotency_key=payload.idempotency_key,
+                conn,
+                user_id=user["id"],
+                kind=payload.kind,
+                params=payload.params,
+                provider=info["provider"],
+                cost=cost,
+                idempotency_key=key,
+                reservation_id=reservation.id,
             )
         except Exception:
-            db.refund_credits(conn, user["id"], cost)
+            # The reservation exists but no job will run against it. Give the
+            # credits back rather than stranding them.
+            with suppress(CentralError):
+                central.release(reservation.id, reason="job_insert_failed")
             raise
     return _job_out(job)
 
@@ -222,9 +386,9 @@ def list_jobs(user: dict = Depends(current_user), limit: int = 50,
               status: str | None = None) -> list[JobOut]:
     """Recent jobs. `needs_review=true` is the reconciliation queue.
 
-    A job lands there when we kept the credits because the provider may have been
-    charged — an uncertain submission, or a failure we could not classify. Someone
-    has to check the provider dashboard and settle it by hand.
+    A job lands there when the platform kept the credits because the provider
+    may have been charged — an uncertain submission, or a failure we could not
+    classify. Someone has to check the provider dashboard and settle it.
     """
     clauses = ["user_id = ?"]
     params: list = [user["id"]]
@@ -256,21 +420,64 @@ def get_job(job_id: str, user: dict = Depends(current_user)) -> JobOut:
 
 
 @app.post("/jobs/{job_id}/cancel", response_model=JobOut)
-def cancel_job(job_id: str, user: dict = Depends(current_user)) -> JobOut:
+def cancel_job(
+    job_id: str, request: Request, user: dict = Depends(current_user)
+) -> JobOut:
+    """Cancel before the provider is contacted, and release the reservation.
+
+    A **queued** job is cancelled outright and its reservation released: nothing
+    was sent, so holding the credits would be taking money for nothing. A
+    **running** job is only flagged — the provider may already have charged, so
+    the reservation stays put and the worker decides at the end.
+    """
+    central = central_client(request)
     with db.connect() as conn:
-        if not db.request_cancel(conn, job_id, user["id"]):
-            raise HTTPException(status_code=409,
-                                detail="job is not cancellable (already finished?)")
-        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-    return _job_out(row)
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE id = ? AND user_id = ?", (job_id, user["id"])
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such job")
+
+    if row["status"] == "queued":
+        with db.connect() as conn:
+            claimed = conn.execute(
+                "UPDATE jobs SET status = 'cancelled', finished_at = ?, stage = 'cancelled' "
+                "WHERE id = ? AND status = 'queued'",
+                (time.time(), job_id),
+            ).rowcount
+        if claimed == 1 and row["reservation_id"]:
+            try:
+                central.release(row["reservation_id"], reason="cancelled_before_start")
+            except CentralError:
+                # The money stays reserved. Flag it so a human settles it rather
+                # than leaving a silent charge behind.
+                with db.connect() as conn:
+                    db.update_job(conn, job_id, needs_review=1)
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return _job_out(row)
+
+    if row["status"] == "running":
+        with db.connect() as conn:
+            db.update_job(conn, job_id, cancel_requested=1)
+        return _job_out(row)
+
+    raise HTTPException(
+        status_code=409, detail="job is not cancellable (already finished?)"
+    )
 
 
 @app.get("/jobs/{job_id}/events")
 def job_events(job_id: str, user: dict = Depends(current_user)) -> StreamingResponse:
-    """Server-sent progress. One direction, no reconnect logic, survives proxies."""
+    """Server-sent progress. One direction, no reconnect logic, survives proxies.
+
+    "uncertain" is terminal. The provider may have accepted the job, so the
+    stream must end and a human must reconcile it — a client that kept waiting
+    would sit there forever.
+    """
 
     def stream() -> Iterator[str]:
-        terminal = {"succeeded", "failed", "cancelled"}
+        terminal = {"succeeded", "failed", "cancelled", "uncertain"}
         while True:
             with db.connect() as conn:
                 row = conn.execute(
@@ -283,6 +490,7 @@ def job_events(job_id: str, user: dict = Depends(current_user)) -> StreamingResp
                 "status": row["status"], "progress": row["progress"],
                 "stage": row["stage"], "error": row["error"],
                 "asset_id": row["asset_id"],
+                "needs_review": bool(row["needs_review"]),
             }
             yield f"data: {json.dumps(payload)}\n\n"
             if row["status"] in terminal:

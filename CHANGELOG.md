@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.2.0] — 2026-11-02
+
+### Changed — authentication and billing move to the central platform
+
+Studio no longer owns identity or credits. Both live in the private
+`forge3d-billing-auth` service, which is shared with other applications on the
+platform. Studio reaches it over HTTP with a service token.
+
+- `POST /auth/request` and `GET /auth/callback` now proxy to the platform. The
+  magic link lands on studio's own registered callback and is exchanged
+  server-side for an access token, which studio keeps in its own cookie.
+- `current_user` verifies the token against the platform. Verification is cached
+  for `STUDIO_SESSION_CACHE_TTL` seconds, so revocation is only as prompt as that
+  window — stated here rather than discovered later.
+- `GET /me` reads the balance and entitlements from the platform. The `apps` and
+  `entitlements` fields are new.
+- `POST /jobs` checks entitlement, creates a reservation with an idempotency key,
+  and only then inserts the job. `jobs.reservation_id` records it.
+- The worker commits on success, releases when nothing was sent, and flags
+  uncertain submissions. It no longer touches a local credit balance.
+- Cancelling a queued job releases its reservation; cancelling a running job only
+  flags it, because the provider may already have charged.
+
+### Added
+
+- `forge3d_studio.central` — the platform client, with the failure policy in one
+  place: fail closed, never invent a state, never retry uncertain work.
+- `forge3d_studio.reconcile` — startup classification of jobs still holding a
+  reservation. A job found `running` after a restart is flagged, never requeued.
+- `users.central_account_id` and `jobs.reservation_id`, both additive migrations.
+  An existing v0.1.2 profile is adopted by email on first sign-in, so generation
+  history stays attached.
+- `uncertain` is now a terminal state on the job event stream, so a client stops
+  waiting instead of hanging.
+- 28 new tests, including the full Phase 6 failure matrix.
+
+### Not changed
+
+Generation, assets, scenes and export work exactly as before; the 29 tests that
+covered them still pass unchanged against the real platform.
+
+### Migration note
+
+Existing `users.credits` values are preserved but ignored. They are **not**
+converted automatically — export them and grant them on the platform
+deliberately. See `docs/central-integration.md`.
+
+
 ## [0.1.2] — 2026-11-01
 
 ### Fixed — an uncertain submission was refunded

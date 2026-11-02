@@ -30,7 +30,11 @@ class LoginResponse(BaseModel):
 class UserOut(BaseModel):
     id: str
     email: str
+    #: Read from the central platform on every call. Studio stores no balance.
     credits: int
+    #: Applications this account can reach, and the features inside studio.
+    apps: list[str] = Field(default_factory=list)
+    entitlements: list[str] = Field(default_factory=list)
 
 
 class JobSubmit(BaseModel):
@@ -43,6 +47,8 @@ class JobSubmit(BaseModel):
 
 class JobOut(BaseModel):
     id: str
+    #: The central platform's reservation for this job, if it has one.
+    reservation_id: str | None = None
     kind: str
     status: str
     provider: str

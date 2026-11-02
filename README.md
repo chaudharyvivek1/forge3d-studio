@@ -101,22 +101,43 @@ token is returned in the API response, because there is no mail provider. That i
 fine locally and unacceptable in public — set it to `false` before deploying, and
 note that it also turns on `Secure` cookies.
 
+## Authentication and billing
+
+Neither lives here. Both belong to the central platform in the private
+repository `chaudharyvivek1/forge3d-billing-auth`, which is shared with other
+applications on the same site. Studio talks to it over HTTP and holds only:
+
+* the job record, and the platform's reservation id on it;
+* a local profile keyed by central account id, so generation history survives.
+
+Studio never sees a password, never stores a credit balance, and never decides
+what something costs the user. `docs/central-integration.md` has the full
+contract and the failure matrix; the platform's own wire spec is
+`docs/central-api.md` in that repository.
+
 ## Configuration
 
 Copy `.env.example`. Everything is env-driven:
 
 | variable | default | meaning |
 |---|---|---|
+| `AUTH_BILLING_API_URL` | `http://127.0.0.1:8080` | the central platform |
+| `AUTH_BILLING_APP_ID` | `forge3d-studio` | which application studio is |
+| `AUTH_BILLING_SERVICE_TOKEN` | — | server-side credential; required |
+| `AUTH_BILLING_TIMEOUT_SECONDS` | `5` | fail closed after this long |
+| `STUDIO_REQUIRE_ENTITLEMENT` | `true` | refuse kinds the account lacks |
+| `STUDIO_SESSION_CACHE_TTL` | `15` | how long a verified session is trusted |
 | `STUDIO_DATA_DIR` | `./.studio` | everything studio writes |
-| `STUDIO_DEV_MODE` | `true` | return login tokens in the response |
-| `STUDIO_STARTING_CREDITS` | `100` | credits granted to a new user |
 | `STUDIO_WORKERS` | `2` | worker threads in the API process |
-| `STUDIO_SESSION_TTL` | `604800` | session lifetime, seconds |
-| `STUDIO_SECRET` | random | stable signing secret for real deployments |
+| `STUDIO_SESSION_TTL` | `604800` | session cookie lifetime, seconds |
 
 Paid jobs (`kind: "provider"`) additionally need the engine's provider config:
 `FORGE3D_PROVIDER` plus that provider's key. Without them the job fails cleanly
-and the credits are refunded.
+and the reservation is released — studio cannot refund anything itself, because
+it holds no credits.
+
+`STUDIO_STARTING_CREDITS` and `STUDIO_SECRET` are still read so an old database
+and an old `.env` keep working, but neither has any effect now.
 
 ## Tests
 
@@ -124,10 +145,21 @@ and the credits are refunded.
 pytest -q
 ```
 
-20 tests, no network, no provider keys, no GPU. They cover the acceptance criteria
-from the scope: sign-up → generate → download in one flow; a paid job refused
-*before* the call; refunds on failure; idempotent submission; cancellation;
-cross-user isolation; and a scene exporting to a page with both models embedded.
+57 tests, no network, no provider keys, no GPU, no real money. They cover
+sign-up → generate → download in one flow; a paid job refused *before* the call;
+refunds on failure; idempotent submission; cancellation; cross-user isolation;
+and a scene exporting to a page with both models embedded.
+
+The central platform's tests run the **real** service app in-process — FastAPI's
+`TestClient` behind studio's HTTP client — so the integration tests exercise the
+actual status codes and reservation state machine rather than a stub. Install the
+private package to run them:
+
+```bash
+pip install -e ../forge3d-billing-auth
+```
+
+Without it those tests are skipped, not failed.
 
 The worker is driven synchronously in tests (`Worker.process_one()`) so "the job
 finished" is a fact rather than a race.

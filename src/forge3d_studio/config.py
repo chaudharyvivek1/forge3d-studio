@@ -27,6 +27,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class Settings:
     # Everything studio writes lives under one directory, so a dev install is
@@ -52,7 +59,36 @@ class Settings:
     # emailing it. It must be false anywhere a stranger can reach the API.
     dev_mode: bool = field(default_factory=lambda: _env_bool("STUDIO_DEV_MODE", True))
 
-    # Money
+    # Central platform. Studio does not own identity or credits: both live in
+    # the private auth/billing service, and these four values are the whole of
+    # studio's side of that contract.
+    auth_billing_api_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "AUTH_BILLING_API_URL", "http://127.0.0.1:8080"
+        ).rstrip("/")
+    )
+    auth_billing_app_id: str = field(
+        default_factory=lambda: os.environ.get("AUTH_BILLING_APP_ID", "forge3d-studio")
+    )
+    #: Never sent to a browser, never logged, never echoed in an error.
+    auth_billing_service_token: str = field(
+        default_factory=lambda: os.environ.get("AUTH_BILLING_SERVICE_TOKEN", "")
+    )
+    auth_billing_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("AUTH_BILLING_TIMEOUT_SECONDS", 5.0)
+    )
+    #: How long a verified session is trusted without asking the platform again.
+    #: Revocation is only as prompt as this window.
+    session_cache_ttl_seconds: float = field(
+        default_factory=lambda: _env_float("STUDIO_SESSION_CACHE_TTL", 15.0)
+    )
+    #: Refuse a job whose kind is not in the account's entitlements.
+    require_entitlement: bool = field(
+        default_factory=lambda: _env_bool("STUDIO_REQUIRE_ENTITLEMENT", True)
+    )
+
+    #: Legacy: kept so an old database still opens. Studio no longer reads or
+    #: writes this balance — the platform owns it.
     starting_credits: int = field(
         default_factory=lambda: _env_int("STUDIO_STARTING_CREDITS", 100)
     )
@@ -66,6 +102,18 @@ class Settings:
         self.db_path = self.db_path or self.data_dir / "studio.db"
         self.storage_dir = self.storage_dir or self.data_dir / "assets"
         self.forge3d_workdir = self.forge3d_workdir or self.data_dir / "forge3d"
+
+    @property
+    def central_configured(self) -> bool:
+        """Whether studio has everything it needs to reach the platform."""
+        return bool(self.auth_billing_api_url and self.auth_billing_service_token)
+
+    def require_central(self) -> None:
+        if not self.central_configured:
+            raise RuntimeError(
+                "studio needs AUTH_BILLING_API_URL and AUTH_BILLING_SERVICE_TOKEN; "
+                "it no longer authenticates users or holds credits itself"
+            )
 
     @property
     def secret(self) -> str:

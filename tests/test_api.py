@@ -9,27 +9,43 @@ from __future__ import annotations
 import json
 
 import pytest
+from central_fake import APP_ID, BASE_URL, SERVICE_TOKEN, FakeCentral
 from fastapi.testclient import TestClient
 
 from forge3d_studio import config, db, storage
 from forge3d_studio.api import app
+from forge3d_studio.central import CentralClient
 from forge3d_studio.worker import Worker
 
 
 @pytest.fixture
-def studio(tmp_path, monkeypatch):
+def central(tmp_path):
+    """The real central platform, in-process. No sockets, no real money."""
+    with FakeCentral(tmp_path) as fake:
+        yield fake
+
+
+@pytest.fixture
+def studio(tmp_path, monkeypatch, central):
     monkeypatch.setenv("STUDIO_DATA_DIR", str(tmp_path / "studio"))
     monkeypatch.setenv("STUDIO_DEV_MODE", "true")
-    monkeypatch.setenv("STUDIO_STARTING_CREDITS", "100")
     monkeypatch.setenv("STUDIO_WORKERS", "0")
+    monkeypatch.setenv("AUTH_BILLING_API_URL", BASE_URL)
+    monkeypatch.setenv("AUTH_BILLING_APP_ID", APP_ID)
+    monkeypatch.setenv("AUTH_BILLING_SERVICE_TOKEN", SERVICE_TOKEN)
     config._settings = None
     config.get_settings(refresh=True)
     db.init_db()
 
+    app.state.central = CentralClient(
+        BASE_URL, APP_ID, SERVICE_TOKEN, transport=central.transport
+    )
     app.state.start_worker = False          # tests drive the queue themselves
     app.state.worker = None
     with TestClient(app) as client:
+        client.central = central
         yield client
+    app.state.central = None
     config._settings = None
 
 
@@ -45,7 +61,7 @@ def sign_in(client) -> dict:
 
 def run_queue() -> int:
     """Drain the queue synchronously. Returns how many jobs ran."""
-    worker = Worker()
+    worker = Worker(central=app.state.central)
     count = 0
     while worker.process_one():
         count += 1
@@ -146,9 +162,11 @@ def test_a_failing_job_is_recorded_not_raised(studio):
 
 # --- 4. the cost guard fires before the money is spent -------------------
 def test_a_paid_job_is_refused_before_it_is_submitted(studio):
-    user = sign_in(studio)
-    with db.connect() as conn:
-        conn.execute("UPDATE users SET credits = 1 WHERE id = ?", (user["id"],))
+    sign_in(studio)
+    # The balance lives on the central platform now, so that is where a test
+    # has to put it to zero.
+    account_id = studio.central.account_for_email("maker@example.com")
+    studio.central.set_balance(account_id, 1)
 
     refused = studio.post("/jobs", json={"kind": "provider", "params": {"prompt": "x"}})
     assert refused.status_code == 402, refused.text
@@ -312,18 +330,22 @@ def test_cancelling_twice_refunds_once(studio):
     assert studio.get("/me").json()["credits"] == user["credits"], "double refund"
 
 
-def test_the_api_works_before_the_lifespan_runs(tmp_path, monkeypatch):
+def test_the_api_works_before_the_lifespan_runs(tmp_path, monkeypatch, central):
     """A client used without `with`, or a script, must not hit 'no such table'."""
     monkeypatch.setenv("STUDIO_DATA_DIR", str(tmp_path / "fresh"))
     monkeypatch.setenv("STUDIO_DEV_MODE", "true")
     config._settings = None
     config.get_settings(refresh=True)
+    app.state.central = CentralClient(
+        BASE_URL, APP_ID, SERVICE_TOKEN, transport=central.transport
+    )
     try:
         client = TestClient(app)          # deliberately not a context manager
         assert client.get("/healthz").status_code == 200
         assert client.post("/auth/request",
                            json={"email": "a@b.com"}).status_code == 200
     finally:
+        app.state.central = None
         config._settings = None
 
 
