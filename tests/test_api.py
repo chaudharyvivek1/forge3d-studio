@@ -325,3 +325,128 @@ def test_the_api_works_before_the_lifespan_runs(tmp_path, monkeypatch):
                            json={"email": "a@b.com"}).status_code == 200
     finally:
         config._settings = None
+
+
+# --- refund policy on paid jobs (found in review) ------------------------
+def _paid_job(studio) -> dict:
+    job = studio.post("/jobs", json={"kind": "provider",
+                                     "params": {"prompt": "a teapot"}}).json()
+    assert job["cost"] > 0
+    return job
+
+
+def test_an_uncertain_submission_is_not_refunded(studio, monkeypatch):
+    """The provider may have accepted and charged for it.
+
+    Refunding here hands out provider work for free, which is why `uncertain` is
+    its own status rather than a flavour of `failed`.
+    """
+    from forge3d_studio import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_require_provider", lambda: "meshy")
+    monkeypatch.setattr(worker_mod, "_engine", lambda: type("E", (), {
+        "create_model": staticmethod(
+            lambda **kw: {"ok": False, "uncertain": True, "idempotency_key": "k-1"})})())
+
+    user = sign_in(studio)
+    job = _paid_job(studio)
+    charged = studio.get("/me").json()["credits"]
+    assert charged == user["credits"] - job["cost"]
+
+    run_queue()
+
+    done = studio.get(f"/jobs/{job['id']}").json()
+    assert done["status"] == "uncertain"
+    assert done["refunded"] is False
+    assert done["needs_review"] is True
+    assert studio.get("/me").json()["credits"] == charged, "an uncertain job was refunded"
+    assert "provider" in done["error"].lower()
+
+
+def test_a_rejected_submission_is_refunded(studio, monkeypatch):
+    """A clean rejection means nothing was produced, so the credits go back."""
+    from forge3d_studio import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_require_provider", lambda: "meshy")
+    monkeypatch.setattr(worker_mod, "_engine", lambda: type("E", (), {
+        "create_model": staticmethod(
+            lambda **kw: {"ok": False, "error": "prompt rejected (400)"})})())
+
+    user = sign_in(studio)
+    job = _paid_job(studio)
+    run_queue()
+
+    done = studio.get(f"/jobs/{job['id']}").json()
+    assert done["status"] == "failed"
+    assert done["refunded"] is True
+    assert studio.get("/me").json()["credits"] == user["credits"]
+
+
+def test_an_unexpected_failure_keeps_the_credits_for_review(studio, monkeypatch):
+    """An exception tells us nothing about whether the remote job exists."""
+    from forge3d_studio import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_require_provider", lambda: "meshy")
+
+    def explode(**kw):
+        raise OSError("connection reset while uploading")
+
+    monkeypatch.setattr(worker_mod, "_engine", lambda: type("E", (), {
+        "create_model": staticmethod(explode)})())
+
+    sign_in(studio)
+    job = _paid_job(studio)
+    charged = studio.get("/me").json()["credits"]
+    run_queue()
+
+    done = studio.get(f"/jobs/{job['id']}").json()
+    assert done["status"] == "failed"
+    assert done["refunded"] is False
+    assert done["needs_review"] is True
+    assert studio.get("/me").json()["credits"] == charged
+
+
+def test_a_free_job_never_needs_review(studio, monkeypatch):
+    from forge3d_studio import worker as worker_mod
+
+    def explode(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(worker_mod, "_engine", lambda: type("E", (), {
+        "create_shape": staticmethod(explode)})())
+
+    sign_in(studio)
+    job = studio.post("/jobs", json={"kind": "shape",
+                                     "params": {"shape": "spring"}}).json()
+    run_queue()
+    done = studio.get(f"/jobs/{job['id']}").json()
+    assert done["status"] == "failed"
+    assert done["refunded"] is False
+    assert done["needs_review"] is False, "a free job has no money to reconcile"
+
+
+def test_an_existing_database_gains_the_new_columns(tmp_path):
+    """`CREATE TABLE IF NOT EXISTS` does not add columns to a live database."""
+    import sqlite3
+
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL,
+            params TEXT NOT NULL, status TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'local', cost INTEGER NOT NULL DEFAULT 0,
+            progress REAL NOT NULL DEFAULT 0, stage TEXT NOT NULL DEFAULT '',
+            error TEXT, asset_id TEXT, idempotency_key TEXT,
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL, started_at REAL, finished_at REAL
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+    db.init_db(db_path)
+
+    with db.connect(db_path) as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    assert {"refunded", "needs_review"} <= columns
