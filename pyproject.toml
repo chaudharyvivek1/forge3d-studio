@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forge3d-studio"
-version = "0.1.1"
+version = "0.1.2"
 description = "The product surface around forge3d: accounts, a job queue, an asset library and shareable scene pages."
 readme = "README.md"
 requires-python = ">=3.10"
