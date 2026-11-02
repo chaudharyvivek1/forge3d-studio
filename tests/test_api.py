@@ -425,6 +425,25 @@ def test_a_free_job_never_needs_review(studio, monkeypatch):
     assert done["needs_review"] is False, "a free job has no money to reconcile"
 
 
+def test_the_reconciliation_queue_is_filterable(studio, monkeypatch):
+    """An operator needs to find the jobs whose credits were kept."""
+    from forge3d_studio import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "_require_provider", lambda: "meshy")
+    monkeypatch.setattr(worker_mod, "_engine", lambda: type("E", (), {
+        "create_model": staticmethod(
+            lambda **kw: {"ok": False, "uncertain": True, "idempotency_key": "k-2"})})())
+
+    sign_in(studio)
+    job = _paid_job(studio)
+    run_queue()
+
+    flagged = studio.get("/jobs?needs_review=true").json()
+    assert [j["id"] for j in flagged] == [job["id"]]
+    assert studio.get("/jobs?needs_review=false").json()[0]["id"] == job["id"]
+    assert studio.get("/jobs?status=uncertain").json()[0]["id"] == job["id"]
+
+
 def test_an_existing_database_gains_the_new_columns(tmp_path):
     """`CREATE TABLE IF NOT EXISTS` does not add columns to a live database."""
     import sqlite3
