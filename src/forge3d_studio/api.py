@@ -217,11 +217,29 @@ def submit_job(payload: JobSubmit, user: dict = Depends(current_user)) -> JobOut
 
 
 @app.get("/jobs", response_model=list[JobOut])
-def list_jobs(user: dict = Depends(current_user), limit: int = 50) -> list[JobOut]:
+def list_jobs(user: dict = Depends(current_user), limit: int = 50,
+              needs_review: bool = False,
+              status: str | None = None) -> list[JobOut]:
+    """Recent jobs. `needs_review=true` is the reconciliation queue.
+
+    A job lands there when we kept the credits because the provider may have been
+    charged — an uncertain submission, or a failure we could not classify. Someone
+    has to check the provider dashboard and settle it by hand.
+    """
+    clauses = ["user_id = ?"]
+    params: list = [user["id"]]
+    if needs_review:
+        clauses.append("needs_review = 1")
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    params.append(max(1, min(200, limit)))
+
     with db.connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-            (user["id"], max(1, min(200, limit))),
+            f"SELECT * FROM jobs WHERE {' AND '.join(clauses)} "
+            f"ORDER BY created_at DESC LIMIT ?",
+            params,
         ).fetchall()
     return [_job_out(row) for row in rows]
 
