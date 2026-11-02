@@ -1,9 +1,10 @@
 """forge3d-studio — the product surface around the forge3d engine.
 
-Studio owns accounts, jobs, storage and scenes. It owns **no geometry**: every
-mesh comes from the pinned forge3d package, and every validation report is the
-engine's own.
+Studio owns jobs, storage, assets and scenes. It owns **no geometry** — every
+mesh comes from the pinned forge3d package — and since v0.2.0 it owns **no
+identity and no money** either: authentication, credits and reservations belong
+to the central platform.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 __all__ = ["__version__"]
