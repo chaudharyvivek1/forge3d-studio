@@ -51,6 +51,11 @@ class JobOut(BaseModel):
     stage: str
     error: str | None = None
     asset_id: str | None = None
+    #: True when the credits were returned; False when they were kept, either
+    #: because the work was delivered or because it may have been billed.
+    refunded: bool = False
+    #: A human should reconcile this job with the provider before anyone retries.
+    needs_review: bool = False
     created_at: float
     started_at: float | None = None
     finished_at: float | None = None
