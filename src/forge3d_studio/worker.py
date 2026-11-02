@@ -39,6 +39,61 @@ class JobCancelled(RuntimeError):
     """Raised inside a handler when the client asked to stop."""
 
 
+class ProviderNotConfigured(RuntimeError):
+    """No provider or key, so nothing was ever sent. A refund is safe here."""
+
+
+class ProviderRejected(RuntimeError):
+    """The provider refused the request outright, so nothing was produced."""
+
+
+class UncertainSubmission(RuntimeError):
+    """The provider may have accepted — and charged for — this job.
+
+    Never refund automatically: the work may exist and have cost real money.
+    Reconcile with the provider using `idempotency_key` first.
+    """
+
+    def __init__(self, idempotency_key: str | None, detail: str) -> None:
+        self.idempotency_key = idempotency_key
+        super().__init__(detail)
+
+
+def _require_provider() -> str:
+    """Fail before the network if no provider is configured.
+
+    Checking first is what makes the refund policy honest: we can only refund
+    without risk when we know for certain nothing was submitted.
+    """
+    from forge3d.config import get_settings as engine_settings
+    from forge3d.providers import registry as provider_registry
+
+    selected = (engine_settings().provider or "auto").strip().lower()
+    providers = provider_registry.list_providers()
+    by_name = {p["name"]: p for p in providers}
+
+    if selected in ("", "auto"):
+        available = [p["name"] for p in providers if p["available"]]
+        if available:
+            return available[0]
+        needed = ", ".join(f"{p['name']} ({p['key_env']})" for p in providers[:3])
+        raise ProviderNotConfigured(
+            "no text-to-3D provider is configured. Set FORGE3D_PROVIDER and its key "
+            f"— for example {needed}. Nothing was sent, so no credits were spent."
+        )
+
+    provider = by_name.get(selected)
+    if provider is None:
+        raise ProviderNotConfigured(
+            f"unknown provider {selected!r}; known: {', '.join(sorted(by_name))}"
+        )
+    if not provider["available"]:
+        raise ProviderNotConfigured(
+            f"provider {selected!r} is not configured: set {provider['key_env']}"
+        )
+    return selected
+
+
 def _engine():
     """Import forge3d lazily so importing studio does not cost 13 s of trimesh."""
     from forge3d import server as engine_server
@@ -105,7 +160,8 @@ def _handle_planet(job: dict, params: dict, progress: Callable[[float, str], Non
 
 def _handle_provider(job: dict, params: dict, progress: Callable[[float, str], None]) -> dict:
     """Paid path. Credits were already reserved by the caller."""
-    progress(0.05, "submitting")
+    provider_name = _require_provider()
+    progress(0.05, f"submitting to {provider_name}")
     produced = _engine().create_model(
         prompt=params.get("prompt", ""),
         name=params.get("name") or "provider-model",
@@ -117,13 +173,18 @@ def _handle_provider(job: dict, params: dict, progress: Callable[[float, str], N
         make_viewer=True,
     )
     if produced.get("uncertain"):
-        # The provider may have created the job. Never retry automatically.
-        raise RuntimeError(
-            f"submission uncertain (key {produced.get('idempotency_key')}); "
-            "check the provider before resubmitting"
+        # The provider may have created the job and charged for it. This is not a
+        # failure, and it is certainly not a refund.
+        raise UncertainSubmission(
+            produced.get("idempotency_key") or job.get("idempotency_key"),
+            "submission uncertain: the provider may have accepted this job "
+            f"(key {produced.get('idempotency_key') or job.get('idempotency_key')}). "
+            "Check the provider dashboard before resubmitting.",
         )
     if not produced.get("ok"):
-        raise RuntimeError(produced.get("error") or "provider generation failed")
+        # A clean rejection: the engine says the provider refused it, so nothing
+        # was produced and the credits go back.
+        raise ProviderRejected(produced.get("error") or "provider generation failed")
     progress(0.7, "downloaded")
     return produced
 
@@ -201,17 +262,54 @@ class Worker:
                           stage="done", asset_id=asset["id"], finished_at=time.time())
 
     def _fail(self, job: dict, exc: Exception) -> None:
+        """Record the outcome, and decide about money.
+
+        The refund rule is the whole point of this method, so it is written out
+        rather than inferred:
+
+        | outcome                        | refund | why                                   |
+        |--------------------------------|--------|---------------------------------------|
+        | cancelled while queued         | yes    | done in `request_cancel`, not here    |
+        | cancelled while running        | no     | the provider may already have charged |
+        | not configured                 | yes    | nothing was sent                      |
+        | provider rejected it           | yes    | nothing was produced                  |
+        | submission uncertain           | **no** | it may exist and have been billed     |
+        | anything else, paid            | **no** | we cannot prove nothing was charged   |
+
+        The last two rows are the ones that matter: refunding an uncertain
+        submission hands out provider work for free, and an unexpected exception
+        tells us nothing about whether the remote job exists.
+        """
+        cost = int(job.get("cost") or 0)
         cancelled = isinstance(exc, JobCancelled)
-        status = "cancelled" if cancelled else "failed"
-        detail = str(exc) if not isinstance(exc, JobCancelled) else "cancelled by the client"
+        uncertain = isinstance(exc, UncertainSubmission)
+        safe_to_refund = isinstance(exc, (ProviderNotConfigured, ProviderRejected))
+
+        if cancelled:
+            status, refund, review = "cancelled", False, False
+            detail = "cancelled by the client"
+        elif uncertain:
+            status, refund, review = "uncertain", False, True
+            detail = str(exc)
+        elif safe_to_refund:
+            status, refund, review = "failed", bool(cost), False
+            detail = str(exc)
+        else:
+            # Unknown failure on a paid job: assume the money may be spent.
+            status = "failed"
+            refund = False
+            review = bool(cost)
+            detail = f"{type(exc).__name__}: {exc}"
+
         with db.connect() as conn:
-            # A paid job that produced nothing is refunded: charging for a failure
-            # the user cannot see the cause of is a support ticket, not a business.
-            if not cancelled and job.get("cost"):
-                db.refund_credits(conn, job["user_id"], int(job["cost"]))
-            db.update_job(conn, job["id"], status=status, stage=status,
-                          error=detail[:2000], finished_at=time.time())
-        if not cancelled:
+            if refund and cost:
+                db.refund_credits(conn, job["user_id"], cost)
+            db.update_job(
+                conn, job["id"], status=status, stage=status, error=detail[:2000],
+                finished_at=time.time(), refunded=1 if refund else 0,
+                needs_review=1 if review else 0,
+            )
+        if not cancelled and not uncertain:
             traceback.print_exc()
 
     # -- the pool --------------------------------------------------------
