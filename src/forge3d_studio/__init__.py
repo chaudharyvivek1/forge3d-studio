@@ -6,5 +6,5 @@ identity and no money** either: authentication, credits and reservations belong
 to the central platform.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = ["__version__"]

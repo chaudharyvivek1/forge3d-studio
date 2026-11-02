@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.2.1] — 2026-11-02
+
+Hardening found by reviewing v0.2.0 across both repositories.
+
+### Fixed — studio could name its own price
+
+`POST /jobs` sent a cost taken from studio's own `KINDS` table, and the platform
+believed it. Studio now sends no price at all: the platform looks it up and the
+job records what the platform charged. `GET /kinds` reads the platform's price
+list and reports `authoritative: false` when it had to fall back.
+
+### Fixed — reservations could be stranded
+
+A reservation created just before the process died had no job attached, so no
+sweep would ever find it and the credits stayed held forever.
+`recover_orphan_reservations` runs at startup and releases reservations with no
+local job, after `STUDIO_ORPHAN_GRACE_SECONDS` (default 300). A reservation with
+any job row is left to normal reconciliation, and a reservation that might have
+reached a provider is never released — a reservation with no job cannot have
+reached one, because only a claimed job runs a handler.
+
+### Fixed — a delivered job could stay uncommitted
+
+A job that succeeded but whose commit failed was `succeeded` with
+`needs_review`, which the old reconciliation skipped because it only looked at
+`queued` and `running`. It now retries the idempotent commit on restart and
+clears the flag. Credits are never released for an asset the user already has.
+
+### Fixed — an outage looked like an empty wallet
+
+`/me` caught any platform error and returned `credits: 0`. A real zero and an
+unreachable billing service are opposite problems, so it now returns `503` when
+the platform is unreachable and `502` when it answers badly.
+
+### Changed
+
+- `AUTH_BILLING_*` session cache window now comes from
+  `STUDIO_SESSION_CACHE_TTL` instead of a hard-coded 15 seconds.
+- `central.CentralClient` gained `prices()` and `reservations_for_app()`.
+
+### Added
+
+- `integration.yml`: a protected workflow that **fails** when the private
+  platform credential is missing, and sets `REQUIRE_INTEGRATION=1` so a missing
+  package is an error rather than a skip. `ci.yml` keeps running without it and
+  says so.
+- 14 tests: price authority, unpriced kinds, orphan recovery and its grace
+  period, commit recovery for a delivered asset, the `/me` split, and a guard
+  that fails if the cross-repository tests are silently skipped.
+
+
 ## [0.2.0] — 2026-11-02
 
 ### Changed — authentication and billing move to the central platform

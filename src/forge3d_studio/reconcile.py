@@ -40,6 +40,7 @@ def reconcile_pending(central: CentralClient, settings=None) -> dict[str, int]:
         "flagged": 0,
         "released": 0,
         "settled": 0,
+        "committed": 0,
         "unreachable": 0,
     }
 
@@ -87,6 +88,38 @@ def reconcile_pending(central: CentralClient, settings=None) -> dict[str, int]:
                 "reconcile: job %s reservation %s was refunded, marked failed",
                 job["id"],
                 reservation_id,
+            )
+
+        elif job["status"] == "succeeded":
+            # The asset is delivered. What is missing is the commit, so retry
+            # it — the platform's commit is idempotent. Credits are never
+            # released for work the user already has.
+            if reservation.state == "settled":
+                with db.connect() as conn:
+                    db.update_job(conn, job["id"], needs_review=0)
+                counts["settled"] += 1
+                logger.info(
+                    "reconcile: job %s was already committed upstream", job["id"]
+                )
+                continue
+            try:
+                state, changed = central.commit(reservation_id)
+            except CentralError as exc:
+                counts["unreachable"] += 1
+                logger.warning(
+                    "reconcile: commit retry failed for job %s (%s); it stays flagged",
+                    job["id"],
+                    exc,
+                )
+                continue
+            with db.connect() as conn:
+                db.update_job(conn, job["id"], needs_review=0)
+            counts["committed"] += 1
+            logger.info(
+                "reconcile: committed reservation %s for delivered job %s (%s)",
+                reservation_id,
+                job["id"],
+                state,
             )
 
         elif reservation.state == "settled":
@@ -208,4 +241,65 @@ def reclaim_stale_jobs(central: CentralClient, settings=None) -> dict[str, int]:
     return counts
 
 
-__all__ = ["reclaim_stale_jobs", "reconcile_pending"]
+def recover_orphan_reservations(central: CentralClient, settings) -> dict[str, int]:
+    """Release reservations that were created but never attached to a job.
+
+    The window this closes is small and real: studio reserves, the platform
+    succeeds, and then the process dies before the job row is inserted. The
+    credits are held against work that will never exist.
+
+    Two guards keep this from becoming a way to lose money:
+
+    * **a grace period.** A reservation younger than ``orphan_grace_seconds`` is
+      left alone, because it may belong to a submit that is still in flight.
+    * **a local job is decisive.** If any job row references the reservation,
+      this sweep does not touch it — the normal reconciliation owns it, and a
+      reservation with a job may already have reached a provider.
+
+    A reservation with no job row cannot have reached a provider, because only a
+    claimed job runs a handler. That is what makes releasing it safe.
+    """
+    grace = float(getattr(settings, "orphan_grace_seconds", 300.0))
+    cutoff = time.time() - grace
+    counts = {"candidates": 0, "released": 0, "skipped": 0}
+
+    try:
+        orphans = central.reservations_for_app(state="reserved", older_than=cutoff)
+    except CentralUnavailable:
+        logger.warning("orphan sweep skipped: central platform unreachable")
+        return counts
+    except CentralError as exc:
+        logger.warning("orphan sweep skipped: %s", exc)
+        return counts
+
+    for reservation in orphans:
+        counts["candidates"] += 1
+        with db.connect() as conn:
+            job = db.job_for_reservation(conn, reservation.id)
+        if job is not None:
+            # Attached after all. The job path decides what happens to it.
+            counts["skipped"] += 1
+            continue
+        try:
+            central.release(reservation.id, reason="orphan_no_job")
+        except CentralError as exc:
+            logger.warning(
+                "orphan sweep: could not release %s (%s)", reservation.id, exc
+            )
+            counts["skipped"] += 1
+            continue
+        counts["released"] += 1
+        logger.warning(
+            "orphan sweep: released reservation %s (%s, %s credits) — no job was "
+            "ever attached to it",
+            reservation.id,
+            reservation.kind,
+            reservation.cost,
+        )
+
+    if counts["candidates"]:
+        logger.info("orphan sweep finished: %s", counts)
+    return counts
+
+
+__all__ = ["reclaim_stale_jobs", "reconcile_pending", "recover_orphan_reservations"]

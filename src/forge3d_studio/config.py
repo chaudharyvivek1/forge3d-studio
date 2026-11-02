@@ -82,6 +82,11 @@ class Settings:
     session_cache_ttl_seconds: float = field(
         default_factory=lambda: _env_float("STUDIO_SESSION_CACHE_TTL", 15.0)
     )
+    #: How long a reservation may exist with no job attached before it is
+    #: treated as orphaned and released. Long enough for a slow submit to land.
+    orphan_grace_seconds: float = field(
+        default_factory=lambda: _env_float("STUDIO_ORPHAN_GRACE_SECONDS", 300.0)
+    )
     #: Refuse a job whose kind is not in the account's entitlements.
     require_entitlement: bool = field(
         default_factory=lambda: _env_bool("STUDIO_REQUIRE_ENTITLEMENT", True)

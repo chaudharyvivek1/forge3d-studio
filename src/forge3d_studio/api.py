@@ -42,7 +42,7 @@ from .models import (
     UserOut,
 )
 from .ratelimit import enforce_job_limit, enforce_login_limit
-from .reconcile import reconcile_pending
+from .reconcile import reconcile_pending, recover_orphan_reservations
 from .worker import KINDS
 
 # Create the schema at import as well as at startup: the statements are
@@ -73,6 +73,9 @@ async def lifespan(application: FastAPI):
 
     try:
         application.state.reconciled = reconcile_pending(central, settings)
+        # Only after reconciliation: a reservation that reconciliation has just
+        # attached to a job must not be mistaken for an orphan.
+        application.state.orphans = recover_orphan_reservations(central, settings)
     except CentralUnavailable:
         # Starting without reconciliation is safe: nothing is retried, and the
         # next boot will find the same pending reservations.
@@ -96,7 +99,7 @@ async def lifespan(application: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="forge3d-studio",
-    version="0.2.0",
+    version="0.2.1",
     description=(
         "The product surface around forge3d: accounts, a job queue, an asset "
         "library and shareable scene pages. Geometry and validation are done by "
@@ -150,8 +153,32 @@ def healthz() -> dict:
 
 
 @app.get("/kinds", response_model=list[KindOut])
-def list_kinds() -> list[KindOut]:
-    return [KindOut(kind=name, **info) for name, info in KINDS.items()]
+def list_kinds(request: Request) -> list[KindOut]:
+    """What can be generated, and what the platform charges for it.
+
+    The price is read from the platform because that is the only authority. If
+    it cannot be reached the configured figures are shown with
+    `authoritative: false` rather than pretending to be current.
+    """
+    prices: dict[str, int] = {}
+    try:
+        prices = central_client(request).prices()
+    except CentralError:
+        prices = {}
+
+    out: list[KindOut] = []
+    for name, info in KINDS.items():
+        priced = name in prices
+        out.append(
+            KindOut(
+                kind=name,
+                cost=prices[name] if priced else int(info["cost"]),
+                authoritative=priced,
+                provider=info["provider"],
+                summary=info["summary"],
+            )
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +325,14 @@ def me(request: Request, user: dict = Depends(current_user)) -> UserOut:
         credits = central.balance(user["central_account_id"])
         features = central.entitlements(user["central_account_id"])
     except CentralUnavailable:
+        # A zero balance and an unreachable billing service look identical to a
+        # user, and are opposite problems. Say which one this is.
         raise _unavailable() from None
-    except CentralError:
-        credits, features = 0, []
+    except CentralError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"billing is not answering correctly: {exc.detail}",
+        ) from None
 
     # Studio only knows about itself. Listing the other applications a person
     # can reach is the platform's job, not ours, and is deliberately not guessed
@@ -411,7 +443,8 @@ def submit_job(
                 kind=payload.kind,
                 params=payload.params,
                 provider=info["provider"],
-                cost=cost,
+                # The platform's price, not studio's configured figure.
+                cost=reservation.cost,
                 idempotency_key=key,
                 reservation_id=reservation.id,
             )

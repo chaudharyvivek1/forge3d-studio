@@ -102,7 +102,10 @@ class SceneOut(BaseModel):
 
 class KindOut(BaseModel):
     kind: str
+    #: The platform's price when it could be read, otherwise studio's own
+    #: configured figure — which is why `authoritative` is reported alongside.
     cost: int
+    authoritative: bool = False
     provider: str
     summary: str
 

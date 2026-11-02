@@ -11,17 +11,32 @@ If the contract changes, these tests break. That is the point.
 
 from __future__ import annotations
 
+import os  # noqa: E402
 from pathlib import Path
 
 import pytest
 
-billing_auth = pytest.importorskip(
-    "billing_auth",
-    reason="studio's integration tests need the private central platform package",
-)
+#: When set, a missing platform package is a hard failure rather than a skip.
+#: The protected integration workflow sets this so CI cannot go green while
+#: testing nothing.
+REQUIRE_INTEGRATION = os.environ.get("REQUIRE_INTEGRATION") == "1"
+
+if REQUIRE_INTEGRATION:
+    import billing_auth  # noqa: E402,F401  - ImportError is the point
+    INTEGRATION_AVAILABLE = True
+else:
+    billing_auth = pytest.importorskip(
+        "billing_auth",
+        reason="studio's integration tests need the private central platform package",
+    )
+    INTEGRATION_AVAILABLE = True
 
 from billing_auth import Settings as CoreSettings  # noqa: E402
 from billing_auth import connect, initialise, register_app, tenancy  # noqa: E402
+
+#: The platform owns pricing now, so the fake has to publish a price list the
+#: way an operator would. A kind with no price is refused upstream.
+PRICES = {"shape": 0, "planet": 0, "provider": 25}
 from billing_auth.service import ServiceSettings, create_app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -59,6 +74,9 @@ class FakeCentral:
         self.client = TestClient(self.app)
         self.auto_entitle = auto_entitle
         self.calls: list[tuple[str, str, int]] = []
+        #: The undamaged transport, so a test can take the platform down and
+        #: bring it back without rebuilding the fixture.
+        self._original = self.transport
 
     # -- lifecycle --------------------------------------------------------
     def __enter__(self) -> FakeCentral:
@@ -67,6 +85,9 @@ class FakeCentral:
         initialise(conn)
         register_app(conn, APP_ID, "Forge3D Studio", callback_url=CALLBACK)
         register_app(conn, "other-app", "Other App", callback_url="http://other.test/cb")
+        for kind, cost in PRICES.items():
+            tenancy.set_price(conn, app_id=APP_ID, kind=kind, cost=cost)
+            tenancy.set_price(conn, app_id="other-app", kind=kind, cost=cost)
         conn.close()
         return self
 
@@ -175,6 +196,9 @@ class FakeCentral:
             return original(method, url, body, headers)
 
         self.transport = wrapped  # type: ignore[assignment]
+
+    def restore(self) -> None:
+        self.transport = self._original  # type: ignore[assignment]
 
     def go_down(self) -> None:
         """Make every call fail the way an outage does."""

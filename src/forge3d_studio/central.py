@@ -253,6 +253,11 @@ class CentralClient:
         features = self.entitlements(account_id)
         return "*" in features or feature in features
 
+    def prices(self) -> dict[str, int]:
+        """The platform's prices for this application: kind -> cost."""
+        payload = self._call("GET", f"/v1/service/apps/{self.app_id}/prices")
+        return {row["kind"]: int(row["cost"]) for row in payload}
+
     # -- reservations -----------------------------------------------------
     @staticmethod
     def _reservation(payload: dict) -> ReservationView:
@@ -301,6 +306,22 @@ class CentralClient:
         )
         return [self._reservation(row) for row in payload]
 
+    def reservations_for_app(
+        self, *, state: str | None = None, older_than: float | None = None, limit: int = 200
+    ) -> list[ReservationView]:
+        """Every reservation this application made, across all its accounts.
+
+        Used by the orphan sweep, which has to look at reservations that no
+        local job ever claimed and therefore belong to no known account flow.
+        """
+        query = [f"limit={limit}"]
+        if state:
+            query.append(f"state={state}")
+        if older_than is not None:
+            query.append(f"older_than={older_than}")
+        payload = self._call("GET", f"/v1/service/reservations?{'&'.join(query)}")
+        return [self._reservation(row) for row in payload]
+
     def _action(self, reservation_id: str, action: str, body: dict | None = None) -> tuple[str, bool]:
         payload = self._call(
             "POST", f"/v1/service/reservations/{reservation_id}/{action}", body or {}
@@ -318,12 +339,16 @@ class CentralClient:
 
 
 def client_from_settings(settings) -> CentralClient:
-    return CentralClient(
+    client = CentralClient(
         settings.auth_billing_api_url,
         settings.auth_billing_app_id,
         settings.auth_billing_service_token,
         timeout=settings.auth_billing_timeout_seconds,
     )
+    # The cache window is configuration, not a constant: an operator who wants
+    # revocation to bite sooner should be able to say so.
+    client.sessions = SessionCache(ttl=settings.session_cache_ttl_seconds)
+    return client
 
 
 __all__ = [

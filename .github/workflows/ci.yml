@@ -39,7 +39,8 @@ jobs:
           if [ -n "$BILLING_AUTH_TOKEN" ]; then
             pip install "forge3d-billing-auth @ git+https://x-access-token:${BILLING_AUTH_TOKEN}@github.com/chaudharyvivek1/forge3d-billing-auth.git"
           else
-            echo "::warning::BILLING_AUTH_TOKEN is not set — central integration tests will be skipped"
+            echo "::warning::BILLING_AUTH_TOKEN is not set — cross-repository tests will be skipped here."
+            echo "::warning::The 'integration' workflow is the one that enforces them."
           fi
 
       - name: Lint

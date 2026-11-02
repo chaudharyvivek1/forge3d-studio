@@ -348,14 +348,17 @@ def job_for_reservation(conn: sqlite3.Connection, reservation_id: str) -> sqlite
 
 
 def jobs_with_pending_reservations(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Jobs that hold a reservation and have not reached a terminal state.
+    """Jobs that hold a reservation the platform has not been told about.
 
-    These are what a restart has to reconcile: the money is reserved on the
-    platform, and studio has to find out what actually happened.
+    Two kinds qualify: work that never reached a terminal state, and work that
+    finished but whose commit failed — a `succeeded` job with `needs_review` set
+    still owes the platform a commit, and its asset is already delivered.
     """
     return conn.execute(
-        "SELECT * FROM jobs WHERE reservation_id IS NOT NULL "
-        "AND status IN ('queued', 'running') ORDER BY created_at"
+        "SELECT * FROM jobs WHERE reservation_id IS NOT NULL AND ("
+        "  status IN ('queued', 'running') "
+        "  OR (status = 'succeeded' AND needs_review = 1)"
+        ") ORDER BY created_at"
     ).fetchall()
 
 
