@@ -65,7 +65,7 @@ async def lifespan(application: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="forge3d-studio",
-    version="0.1.1",
+    version="0.1.2",
     description=(
         "The product surface around forge3d: accounts, a job queue, an asset "
         "library and shareable scene pages. Geometry and validation are done by "
@@ -175,6 +175,7 @@ def _job_out(row: Any) -> JobOut:
         cost=row["cost"], progress=row["progress"], stage=row["stage"],
         error=row["error"], asset_id=row["asset_id"], created_at=row["created_at"],
         started_at=row["started_at"], finished_at=row["finished_at"],
+        refunded=bool(row["refunded"]), needs_review=bool(row["needs_review"]),
     )
 
 
