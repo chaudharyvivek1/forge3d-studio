@@ -108,3 +108,44 @@ Billing, teams, permissions beyond "your own rows", a marketplace, GPU inference
 webhooks, and a second service. Each of those is a decision with a cost, and none
 of them is needed to answer the question this repo exists to answer: can someone
 sign in, generate a model, and get a link they can send to a client?
+
+## Worker leases
+
+A job is claimed by a conditional `UPDATE` that also stamps `worker_id`,
+`heartbeat_at` and `lease_expires_at`. That row is a lease: it says *this worker
+is running this job until this moment*.
+
+A heartbeat thread renews the lease on everything the worker owns, on a timer
+rather than only when a handler reports progress, because a provider call can
+take minutes without calling back. A worker that dies stops renewing, and its
+leases expire.
+
+The sweeper then reclaims expired jobs. It never re-queues them: for a paid kind
+the provider may already have been called, so the job becomes `uncertain` and its
+reservation is flagged for review. A free kind failed safely and is marked
+`failed`. This is the same rule the startup reconciliation applies, and it exists
+because the alternative — retrying — is how a product pays twice for one job.
+
+## Event stream
+
+Three properties, each fixing a specific production failure:
+
+- **only on change** — an idle job costs one database read per poll, not a stream
+  of identical frames;
+- **heartbeat comments** — proxies drop connections that go quiet, and a browser
+  that reconnects forever is worse than a slow one;
+- **ids and `Last-Event-ID`** — a reconnecting client resumes instead of
+  restarting its display.
+
+`uncertain` is terminal. The client stops, the page says "needs manual review",
+and a human settles it.
+
+## Limits
+
+Rate limiting is an in-process sliding window, not Redis. That is honest about
+what it does: it stops one client hammering one endpoint, and it does not pretend
+to stop a distributed attack. The switch point is the same one that moves SQLite
+to Postgres — the moment a second process writes.
+
+`X-Forwarded-For` is deliberately not trusted for the login limit. A spoofable
+header is worse than no limit, because it looks like one.

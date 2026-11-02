@@ -152,4 +152,60 @@ def reconcile_pending(central: CentralClient, settings=None) -> dict[str, int]:
     return counts
 
 
-__all__ = ["reconcile_pending"]
+def reclaim_stale_jobs(central: CentralClient, settings=None) -> dict[str, int]:
+    """Reclaim jobs whose worker stopped heartbeating mid-flight.
+
+    This is the running-process case, not the restart case: another worker is
+    still alive, a lease expired, and the job it was running is now in limbo.
+
+    The job is **never** put back in the queue. For a paid kind the provider may
+    already have been called, so it becomes `uncertain` and its reservation is
+    flagged for review. A free kind failed safely, so it is simply marked failed.
+    """
+    counts = {"stale": 0, "flagged": 0, "failed": 0}
+    with db.connect() as conn:
+        stale = db.stale_running_jobs(conn)
+
+    for job in stale:
+        counts["stale"] += 1
+        cost = int(job["cost"] or 0)
+        reservation_id = job["reservation_id"]
+
+        if reservation_id and cost:
+            try:
+                central.flag(reservation_id, reason="worker_lease_expired")
+            except CentralError as exc:
+                logger.warning(
+                    "reclaim: could not flag reservation %s for job %s (%s)",
+                    reservation_id,
+                    job["id"],
+                    exc,
+                )
+            status_value, review = "uncertain", 1
+            detail = (
+                "the worker stopped heartbeating while this job was running; the "
+                "provider may have accepted it, so it was not retried"
+            )
+        else:
+            status_value, review = "failed", 0
+            detail = "the worker stopped heartbeating while this job was running"
+
+        with db.connect() as conn:
+            db.update_job(
+                conn,
+                job["id"],
+                status=status_value,
+                stage="reclaimed",
+                error=detail,
+                finished_at=time.time(),
+                needs_review=review,
+            )
+        counts["flagged" if review else "failed"] += 1
+        logger.warning(
+            "reclaim: job %s lease expired on worker %s", job["id"], job["worker_id"]
+        )
+
+    return counts
+
+
+__all__ = ["reclaim_stale_jobs", "reconcile_pending"]

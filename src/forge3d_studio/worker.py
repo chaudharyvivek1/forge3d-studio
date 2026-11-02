@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 import traceback
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -217,14 +218,23 @@ class Worker:
     ) -> None:
         self.settings = settings or get_settings()
         self.central = central or client_from_settings(self.settings)
+        #: Identity matters because a lease is only meaningful if you can say
+        #: whose it is. A restarted process is a different worker, and that is
+        #: exactly what lets its predecessor's jobs be recognised as abandoned.
+        self.worker_id = f"worker-{uuid.uuid4().hex[:12]}"
+        self.lease_seconds = float(self.settings.worker_lease_seconds)
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        self._last_sweep = 0.0
+        self._sweep_lock = threading.Lock()
 
     # -- one job ---------------------------------------------------------
     def process_one(self) -> bool:
         """Claim and run a single job. Returns False when the queue is empty."""
         with db.connect() as conn:
-            row = db.claim_next_job(conn)
+            row = db.claim_next_job(
+                conn, worker_id=self.worker_id, lease_seconds=self.lease_seconds
+            )
             if row is None:
                 return False
             job = dict(row)
@@ -387,13 +397,61 @@ class Worker:
             return False
 
     # -- the pool --------------------------------------------------------
+    def heartbeat(self) -> int:
+        """Renew the lease on every job this worker is running.
+
+        A worker that is alive but slow must not lose its jobs, so the lease is
+        renewed on a timer rather than only when a handler reports progress.
+        """
+        now = time.time()
+        with db.connect() as conn:
+            return conn.execute(
+                "UPDATE jobs SET heartbeat_at = ?, lease_expires_at = ? "
+                "WHERE status = 'running' AND worker_id = ?",
+                (now, now + self.lease_seconds, self.worker_id),
+            ).rowcount
+
+    def _heartbeat_loop(self) -> None:
+        interval = max(1.0, self.lease_seconds / 3.0)
+        while not self._stop.wait(interval):
+            try:
+                self.heartbeat()
+            except Exception:  # noqa: BLE001 - a heartbeat must never kill the pool
+                logger.exception("heartbeat failed on %s", self.worker_id)
+
+    def sweep(self) -> dict[str, int]:
+        """Reclaim jobs whose lease expired, at most once per configured window."""
+        from .reconcile import reclaim_stale_jobs
+
+        with self._sweep_lock:
+            now = time.time()
+            if now - self._last_sweep < self.settings.stale_sweep_seconds:
+                return {}
+            self._last_sweep = now
+            try:
+                counts = reclaim_stale_jobs(self.central, self.settings)
+            except Exception:  # noqa: BLE001 - the pool keeps working regardless
+                logger.exception("stale job sweep failed")
+                return {}
+            if counts.get("stale"):
+                logger.warning("stale sweep reclaimed %s job(s)", counts["stale"])
+            return counts
+
     def run_forever(self, poll_seconds: float = 0.5) -> None:
         while not self._stop.is_set():
+            self.sweep()
             if not self.process_one():
                 self._stop.wait(poll_seconds)
 
     def start(self, threads: int | None = None) -> list[threading.Thread]:
         count = threads or self.settings.worker_threads
+        heartbeat = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"studio-heartbeat-{self.worker_id}",
+            daemon=True,
+        )
+        heartbeat.start()
+        self._threads.append(heartbeat)
         for index in range(count):
             thread = threading.Thread(target=self.run_forever,
                                       name=f"studio-worker-{index}", daemon=True)

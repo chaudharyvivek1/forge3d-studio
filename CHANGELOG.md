@@ -34,7 +34,31 @@ platform. Studio reaches it over HTTP with a service token.
   history stays attached.
 - `uncertain` is now a terminal state on the job event stream, so a client stops
   waiting instead of hanging.
-- 28 new tests, including the full Phase 6 failure matrix.
+- 28 new tests for the integration, including the full failure matrix.
+
+### Reliability (the v0.1.3 scope)
+
+- **Worker leases and heartbeats.** A claim records `worker_id`, `heartbeat_at`
+  and `lease_expires_at`; a heartbeat thread renews the lease on everything the
+  worker is running. A worker that stops breathing loses its jobs.
+- **Stale job reclamation.** Expired leases are swept by the pool. A paid job is
+  moved to `uncertain` and its reservation flagged; a free job is marked
+  `failed`. Nothing is ever requeued, because a retried paid submission is a
+  second charge.
+- **Local idempotency index.** A unique partial index on
+  `(user_id, idempotency_key)` backs up the platform's own deduplication.
+- **SSE reliability.** Frames are only sent when something changed, a heartbeat
+  comment keeps idle connections alive through proxies, every frame carries an
+  id, `Last-Event-ID` resumes a reconnecting client, and the stream asks the
+  browser to retry with `retry:`. `x-accel-buffering: no` stops nginx eating it.
+- **Uncertain in the frontend.** The job stream ends on `uncertain` and the page
+  says "needs manual review" instead of waiting for a state that will not come.
+- **Rate limits.** Magic-link requests are limited per client address (the one
+  endpoint that makes the server send mail) and job submissions per account.
+- **Payload limits.** Oversized bodies are refused before parsing; oversized
+  generation parameters are refused before anything is reserved.
+- 15 more tests: leases, heartbeats, reclamation, stream framing, resume,
+  rate limits and payload guards.
 
 ### Not changed
 

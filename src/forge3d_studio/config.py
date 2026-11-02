@@ -95,6 +95,41 @@ class Settings:
 
     # Workers
     worker_threads: int = field(default_factory=lambda: _env_int("STUDIO_WORKERS", 2))
+    #: How long a claim is valid without a heartbeat. A worker that stops
+    #: breathing loses its lease, which is how a dead worker is noticed while
+    #: the rest of the process keeps running.
+    worker_lease_seconds: float = field(
+        default_factory=lambda: _env_float("STUDIO_WORKER_LEASE_SECONDS", 120.0)
+    )
+    #: How often the pool looks for expired leases.
+    stale_sweep_seconds: float = field(
+        default_factory=lambda: _env_float("STUDIO_STALE_SWEEP_SECONDS", 60.0)
+    )
+
+    # Server-sent events
+    sse_heartbeat_seconds: float = field(
+        default_factory=lambda: _env_float("STUDIO_SSE_HEARTBEAT_SECONDS", 15.0)
+    )
+    sse_poll_seconds: float = field(
+        default_factory=lambda: _env_float("STUDIO_SSE_POLL_SECONDS", 0.4)
+    )
+
+    # Limits
+    login_rate_limit: int = field(
+        default_factory=lambda: _env_int("STUDIO_LOGIN_RATE_LIMIT", 10)
+    )
+    job_rate_limit: int = field(
+        default_factory=lambda: _env_int("STUDIO_JOB_RATE_LIMIT", 60)
+    )
+    rate_window_seconds: float = field(
+        default_factory=lambda: _env_float("STUDIO_RATE_WINDOW", 60.0)
+    )
+    max_payload_bytes: int = field(
+        default_factory=lambda: _env_int("STUDIO_MAX_PAYLOAD_BYTES", 64 * 1024)
+    )
+    max_params_bytes: int = field(
+        default_factory=lambda: _env_int("STUDIO_MAX_PARAMS_BYTES", 8 * 1024)
+    )
 
     _secret: str = field(default_factory=lambda: os.environ.get("STUDIO_SECRET", ""))
 

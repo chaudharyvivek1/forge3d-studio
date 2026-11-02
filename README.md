@@ -139,13 +139,28 @@ it holds no credits.
 `STUDIO_STARTING_CREDITS` and `STUDIO_SECRET` are still read so an old database
 and an old `.env` keep working, but neither has any effect now.
 
+## Reliability behaviour
+
+A job is claimed with a lease. The worker renews it on a timer, and a worker
+that stops renewing loses its jobs to the sweeper: a paid job becomes
+`uncertain` with its reservation held, a free job becomes `failed`. Nothing is
+re-queued automatically — a retried paid submission is a second charge.
+
+The event stream only sends a frame when something changed, emits a heartbeat
+comment while idle, carries ids, honours `Last-Event-ID`, and ends on
+`uncertain` so the page can say "needs manual review" instead of waiting.
+
+Limits are in-process and deliberately simple: `STUDIO_LOGIN_RATE_LIMIT` per
+client address, `STUDIO_JOB_RATE_LIMIT` per account, `STUDIO_MAX_PAYLOAD_BYTES`
+on the request and `STUDIO_MAX_PARAMS_BYTES` on generation parameters.
+
 ## Tests
 
 ```bash
 pytest -q
 ```
 
-57 tests, no network, no provider keys, no GPU, no real money. They cover
+72 tests, no network, no provider keys, no GPU, no real money. They cover
 sign-up → generate → download in one flow; a paid job refused *before* the call;
 refunds on failure; idempotent submission; cancellation; cross-user isolation;
 and a scene exporting to a page with both models embedded.
@@ -160,6 +175,9 @@ pip install -e ../forge3d-billing-auth
 ```
 
 Without it those tests are skipped, not failed.
+
+The suite takes around 45 seconds, most of it real geometry in the generation
+tests. `pytest -q tests/test_reliability.py` alone is under ten.
 
 The worker is driven synchronously in tests (`Worker.process_one()`) so "the job
 finished" is a fact rather than a race.

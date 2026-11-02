@@ -142,6 +142,11 @@ MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         #: The central platform's reservation. Money is tracked there now; this
         #: column is how a job and its reservation find each other again.
         ("reservation_id", "TEXT"),
+        #: Worker lease. A claim is a row with an expiry; a worker that stops
+        #: heartbeating loses it, which is how a dead worker is detected.
+        ("worker_id", "TEXT"),
+        ("heartbeat_at", "REAL"),
+        ("lease_expires_at", "REAL"),
     ],
     "users": [
         #: Studio's local profile is keyed by the central account id, so a
@@ -157,6 +162,11 @@ INDEX_MIGRATIONS: list[str] = [
     "CREATE UNIQUE INDEX IF NOT EXISTS users_central "
     "ON users(central_account_id) WHERE central_account_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS jobs_reservation ON jobs(reservation_id)",
+    # Belt and braces beside the platform's own idempotency: two submits with
+    # the same key cannot both insert a local job, whatever happens upstream.
+    "CREATE UNIQUE INDEX IF NOT EXISTS jobs_idempotency "
+    "ON jobs(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS jobs_lease ON jobs(status, lease_expires_at)",
 ]
 
 
@@ -349,7 +359,32 @@ def jobs_with_pending_reservations(conn: sqlite3.Connection) -> list[sqlite3.Row
     ).fetchall()
 
 
-def claim_next_job(conn: sqlite3.Connection) -> sqlite3.Row | None:
+def stale_running_jobs(conn: sqlite3.Connection, now: float | None = None) -> list[sqlite3.Row]:
+    """Jobs whose worker stopped heartbeating before the lease expired."""
+    now = time.time() if now is None else now
+    return conn.execute(
+        "SELECT * FROM jobs WHERE status = 'running' "
+        "AND (lease_expires_at IS NULL OR lease_expires_at < ?) "
+        "ORDER BY started_at",
+        (now,),
+    ).fetchall()
+
+
+def job_by_idempotency_key(
+    conn: sqlite3.Connection, user_id: str, key: str | None
+) -> sqlite3.Row | None:
+    if not key:
+        return None
+    return conn.execute(
+        "SELECT * FROM jobs WHERE user_id = ? AND idempotency_key = ?", (user_id, key)
+    ).fetchone()
+
+
+def claim_next_job(
+    conn: sqlite3.Connection,
+    worker_id: str | None = None,
+    lease_seconds: float = 120.0,
+) -> sqlite3.Row | None:
     """Take one queued job, atomically.
 
     `UPDATE ... WHERE status = 'queued'` with a rowcount check is what makes two
@@ -361,10 +396,12 @@ def claim_next_job(conn: sqlite3.Connection) -> sqlite3.Row | None:
         ).fetchone()
         if candidate is None:
             return None
+        now = time.time()
         claimed = conn.execute(
-            """UPDATE jobs SET status = 'running', started_at = ?, stage = 'starting'
+            """UPDATE jobs SET status = 'running', started_at = ?, stage = 'starting',
+                               worker_id = ?, heartbeat_at = ?, lease_expires_at = ?
                WHERE id = ? AND status = 'queued'""",
-            (time.time(), candidate["id"]),
+            (now, worker_id, now, now + lease_seconds, candidate["id"]),
         ).rowcount
         if claimed == 1:
             return conn.execute("SELECT * FROM jobs WHERE id = ?", (candidate["id"],)).fetchone()
@@ -373,7 +410,8 @@ def claim_next_job(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 def update_job(conn: sqlite3.Connection, job_id: str, **fields) -> None:
     allowed = {"status", "progress", "stage", "error", "asset_id",
-               "finished_at", "cancel_requested", "refunded", "needs_review"}
+               "finished_at", "cancel_requested", "refunded", "needs_review",
+               "worker_id", "heartbeat_at", "lease_expires_at"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"cannot update job fields: {sorted(unknown)}")

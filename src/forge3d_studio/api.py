@@ -14,8 +14,8 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db, storage
@@ -41,6 +41,7 @@ from .models import (
     SceneOut,
     UserOut,
 )
+from .ratelimit import enforce_job_limit, enforce_login_limit
 from .reconcile import reconcile_pending
 from .worker import KINDS
 
@@ -57,6 +58,10 @@ async def lifespan(application: FastAPI):
     """Start the DB and the worker pool with the app, and stop them with it."""
     settings = get_settings()
     db.init_db()
+
+    # Rate-limit counters start empty on every boot, and a fresh app gets fresh
+    # counters rather than inheriting whatever a previous one counted.
+    application.state.limiters = {}
 
     # The central platform is the authority for identity and money. If studio
     # cannot reach it at boot it still starts — assets, scenes and history stay
@@ -98,6 +103,29 @@ app = FastAPI(
         "the pinned forge3d engine, never reimplemented here."
     ),
 )
+
+
+@app.middleware("http")
+async def limit_payload(request: Request, call_next):
+    """Refuse an oversized body before it is parsed.
+
+    FastAPI would happily read a 500 MB JSON document into memory first. The
+    declared length is checked up front; a body without a length is left to the
+    server's own limits.
+    """
+    settings = get_settings()
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            too_big = int(declared) > settings.max_payload_bytes
+        except ValueError:
+            too_big = False
+        if too_big:
+            return JSONResponse(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                content={"detail": "request body is too large"},
+            )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +225,9 @@ def request_login(payload: LoginRequest, request: Request) -> LoginResponse:
     The link lands on this application's own callback, which is registered with
     the platform — studio cannot redirect it, and neither can a caller.
     """
+    settings = get_settings()
+    enforce_login_limit(request, settings.login_rate_limit, settings.rate_window_seconds)
+
     central = central_client(request)
     try:
         result = central.request_login(payload.email)
@@ -313,6 +344,19 @@ def submit_job(
     cost = int(info["cost"])
 
     settings = get_settings()
+    enforce_job_limit(
+        request, user["id"], settings.job_rate_limit, settings.rate_window_seconds
+    )
+
+    # Bounded before anything is reserved: a huge or deeply nested params object
+    # is rejected here rather than after the user has been charged for it.
+    raw_params = json.dumps(payload.params or {})
+    if len(raw_params) > settings.max_params_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"generation parameters are too large ({len(raw_params)} bytes)",
+        )
+
     central = central_client(request)
     account_id = user["central_account_id"]
 
@@ -467,37 +511,100 @@ def cancel_job(
     )
 
 
-@app.get("/jobs/{job_id}/events")
-def job_events(job_id: str, user: dict = Depends(current_user)) -> StreamingResponse:
-    """Server-sent progress. One direction, no reconnect logic, survives proxies.
+def event_frames(
+    job_id: str,
+    user_id: str,
+    settings,
+    last_event_id: str | None = None,
+) -> Iterator[str]:
+    """The bytes of the job event stream, as a plain generator.
 
-    "uncertain" is terminal. The provider may have accepted the job, so the
+    Split out from the route so it can be read a frame at a time in a test
+    without holding a socket open, and so the framing rules live in one place:
+
+    * **an event is only sent when something changed** — an idle job costs one
+      database read per poll instead of a stream of identical frames;
+    * **a heartbeat comment goes out during quiet periods**, because a proxy
+      drops a connection that has been silent for a minute and the browser then
+      reconnects forever;
+    * **every frame carries an id**, and ``Last-Event-ID`` is honoured, so a
+      reconnecting client resumes instead of restarting the display.
+    """
+    poll_seconds = max(0.005, settings.sse_poll_seconds)
+    heartbeat_seconds = max(0.005, settings.sse_heartbeat_seconds)
+    terminal = {"succeeded", "failed", "cancelled", "uncertain"}
+
+    try:
+        sequence = int(last_event_id or 0)
+    except ValueError:
+        sequence = 0
+
+    # Ask the browser to come back, rather than letting it pick its own rate.
+    yield "retry: 5000\n\n"
+
+    last_payload: dict | None = None
+    last_sent = time.monotonic()
+
+    while True:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE id = ? AND user_id = ?", (job_id, user_id)
+            ).fetchone()
+
+        if row is None:
+            # A job that is not yours looks exactly like one that does not
+            # exist. Both end the stream; neither leaks the difference.
+            yield 'data: {"error": "no such job"}\n\n'
+            return
+
+        payload = {
+            "status": row["status"],
+            "progress": row["progress"],
+            "stage": row["stage"],
+            "error": row["error"],
+            "asset_id": row["asset_id"],
+            "needs_review": bool(row["needs_review"]),
+        }
+
+        now = time.monotonic()
+        if payload != last_payload:
+            sequence += 1
+            yield f"id: {sequence}\ndata: {json.dumps(payload)}\n\n"
+            last_payload = payload
+            last_sent = now
+        elif now - last_sent >= heartbeat_seconds:
+            # A comment frame: valid SSE, ignored by EventSource, enough to keep
+            # the connection alive through a proxy that counts idle seconds.
+            yield ": heartbeat\n\n"
+            last_sent = now
+
+        if row["status"] in terminal:
+            return
+        time.sleep(poll_seconds)
+
+
+@app.get("/jobs/{job_id}/events")
+def job_events(
+    job_id: str,
+    user: dict = Depends(current_user),
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+) -> StreamingResponse:
+    """Server-sent progress, one direction, resumable, with heartbeats.
+
+    `uncertain` is terminal. The provider may have accepted the job, so the
     stream must end and a human must reconcile it — a client that kept waiting
     would sit there forever.
     """
-
-    def stream() -> Iterator[str]:
-        terminal = {"succeeded", "failed", "cancelled", "uncertain"}
-        while True:
-            with db.connect() as conn:
-                row = conn.execute(
-                    "SELECT * FROM jobs WHERE id = ? AND user_id = ?", (job_id, user["id"])
-                ).fetchone()
-            if row is None:
-                yield 'data: {"error": "no such job"}\n\n'
-                return
-            payload = {
-                "status": row["status"], "progress": row["progress"],
-                "stage": row["stage"], "error": row["error"],
-                "asset_id": row["asset_id"],
-                "needs_review": bool(row["needs_review"]),
-            }
-            yield f"data: {json.dumps(payload)}\n\n"
-            if row["status"] in terminal:
-                return
-            time.sleep(0.4)
-
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_frames(job_id, user["id"], get_settings(), last_event_id),
+        media_type="text/event-stream",
+        headers={
+            "cache-control": "no-cache",
+            "connection": "keep-alive",
+            # Stops nginx buffering the stream into uselessness.
+            "x-accel-buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

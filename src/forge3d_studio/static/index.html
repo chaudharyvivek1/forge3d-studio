@@ -149,20 +149,52 @@ $("btn-run").onclick = async () => {
   } finally { $("btn-run").disabled = false; }
 };
 
+// Terminal states end the stream. "uncertain" belongs here: the provider may
+// have accepted the job and charged for it, so nothing will change on its own
+// and the only useful thing the page can do is say so plainly.
+const TERMINAL = ["succeeded", "failed", "cancelled", "uncertain"];
+
+function showUncertain(data) {
+  $("status").textContent = "needs manual review";
+  $("status").style.color = "#c2410c";
+  $("bar").style.width = "100%";
+  $("note").textContent = data.error ||
+    "This job may have been accepted — and charged — by the provider. It has " +
+    "been kept for review and will not be retried automatically.";
+}
+
 function follow(jobId) {
   return new Promise((resolve) => {
     const source = new EventSource(`/jobs/${jobId}/events`);
     source.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+      let data;
+      try { data = JSON.parse(event.data); } catch { return; }
+      if (data.error && !data.status) {
+        $("status").textContent = "failed";
+        $("note").textContent = data.error;
+        source.close();
+        resolve();
+        return;
+      }
+      if (data.status === "uncertain") {
+        showUncertain(data);
+        source.close();
+        loadAssets().then(resolve);
+        return;
+      }
       $("status").textContent = data.status + (data.stage ? ` · ${data.stage}` : "");
       $("bar").style.width = Math.round((data.progress || 0) * 100) + "%";
-      if (["succeeded", "failed", "cancelled"].includes(data.status)) {
+      if (TERMINAL.includes(data.status)) {
         source.close();
         if (data.error) $("note").textContent = data.error;
         loadAssets().then(resolve);
       }
     };
-    source.onerror = () => { source.close(); resolve(); };
+    // EventSource reconnects on its own; the server sends `retry:` and honours
+    // Last-Event-ID, so a dropped connection resumes instead of restarting.
+    source.onerror = () => {
+      if (source.readyState === EventSource.CLOSED) { resolve(); }
+    };
   });
 }
 
