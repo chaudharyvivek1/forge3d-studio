@@ -30,11 +30,42 @@ reservation with any local job row is still never touched.
 - CI is split three ways: `unit` (no credential), `integration` (credential
   required, fails rather than skips), `regression` (everything, nightly).
 
-### Added
+### Fixed — Windows CI failed on a bash conditional
 
-- 16 pagination and recovery tests, including 1,001 orphans, page boundaries at
-  199/200/201, per-item release failures, mid-sweep outages, repeated runs and a
-  duplicate-processing check.
+`ci.yml` installed the private platform package behind `if [ -n "$TOKEN" ]`.
+GitHub's Windows runners default to PowerShell, which rejects that syntax with
+`ParserError: Missing '(' after 'if' in if statement`, so both Windows jobs
+failed before running a single test.
+
+Every workflow now sets `defaults.run.shell: bash`, so a shell script written
+once behaves the same on Ubuntu, macOS and Windows. That fixes this instance and
+the whole class of bug with it.
+
+### Changed — one pipeline, not two
+
+`ci.yml` duplicated the newer workflows and was the only place the failure could
+happen. Its valuable part — the cross-platform matrix — moved to the maintained
+workflows, and it was deleted:
+
+| Workflow | Runs | Credentials |
+| --- | --- | --- |
+| `unit` | Ubuntu, macOS, Windows × Python 3.10, 3.12 | none |
+| `integration` | Ubuntu, PRs and main | `BILLING_AUTH_TOKEN`, required |
+| `regression` | Ubuntu, macOS, Windows, nightly and main | `BILLING_AUTH_TOKEN`, required |
+
+`integration` fails rather than skipping when the credential is absent, and fork
+pull requests get an explicit "nothing ran" notice instead of a false pass.
+
+### Added — pagination input validation
+
+`reservations_for_app` now rejects a page size outside 1–1000, a non-integer
+page size, and a page budget below 1, instead of forwarding them and letting the
+platform answer with a 422. A page budget that runs out raises rather than
+returning a partial list as if it were complete.
+
+- 18 client tests: invalid limits, an empty page that still has a cursor, a
+  repeated cursor, the page-budget ceiling, cursor URL encoding, filters carried
+  across pages, and a mid-pagination platform error.
 
 ### Note
 

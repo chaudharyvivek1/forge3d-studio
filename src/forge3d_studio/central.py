@@ -31,6 +31,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+#: The platform's own maximum page size. Mirrored here so a caller gets a clear
+#: local error instead of a 422 from the far side of a network boundary.
+MAX_PAGE_SIZE = 1000
+
 #: (method, url, body, headers) -> (status, decoded json)
 Transport = Callable[[str, str, "dict | None", "dict[str, str]"], "tuple[int, dict]"]
 
@@ -327,6 +331,18 @@ class CentralClient:
         (which would mean the sweep is not converging). Both raise, so a caller
         never mistakes a partial read for a complete one.
         """
+        # The platform caps a page at 1000. Asking for more is a caller bug, and
+        # silently clamping it would hide the fact that the caller expected
+        # something the API cannot do.
+        if not isinstance(page_size, int) or isinstance(page_size, bool):
+            raise ValueError("page_size must be an integer")
+        if not 1 <= page_size <= MAX_PAGE_SIZE:
+            raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
+        if not isinstance(max_pages, int) or isinstance(max_pages, bool):
+            raise ValueError("max_pages must be an integer")
+        if max_pages < 1:
+            raise ValueError("max_pages must be at least 1")
+
         collected: list[ReservationView] = []
         cursor: str | None = None
         seen: set[str] = set()
@@ -397,6 +413,7 @@ __all__ = [
     "InsufficientCredits",
     "InvalidSession",
     "NotEntitled",
+    "MAX_PAGE_SIZE",
     "ReservationView",
     "SessionCache",
     "SessionView",
